@@ -282,6 +282,12 @@ async function countL0Rows(dbPath: string, sessionKeys: string[]): Promise<numbe
 // The e2e scenarios
 // ============================
 
+// deferred: TDAI_GATEWAY_API_KEY smoke coverage (401 on missing/wrong Bearer
+// token, 200 on the correct one, /health reachable without auth) is
+// intentionally NOT automated in this suite — plan §8 documents the manual
+// one-off procedure. Automating it here would require a third gateway
+// subprocess/port for the auth-enabled config; deferred until that cost is
+// justified. Do not fake it with in-process checks.
 describe("gateway multi-user e2e (real subprocess + HTTP)", () => {
   it("routes per-user captures to isolated stores, fails closed on invalid uids, and guards /seed", async () => {
     const gw = await startGateway({ port: PORT_MULTI_USER, multiUser: true, ownerUserIds: ["ops-admin"] });

@@ -435,6 +435,13 @@ def test_shutdown_end_session_falls_back_without_identity(provider_with_fake_sup
         # empty / whitespace-only
         ("", None),
         ("   ", None),
+        # Unicode whitespace is NOT trimmed (ASCII-only trim, paired with the
+        # Gateway's /^[ \t\r\n\f\v]+|[ \t\r\n\f\v]+$/g): a bare Python
+        # strip() would eat U+FEFF and accept an id the Gateway rejects.
+        ("\ufeffwendy", None),
+        ("wendy\u00a0", None),
+        # ASCII whitespace still trims
+        ("\t\nwendy\r\n", "wendy"),
         # non-ASCII
         ("王芳", None),
         ("wèndy", None),

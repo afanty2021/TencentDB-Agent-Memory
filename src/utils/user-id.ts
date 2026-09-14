@@ -5,11 +5,23 @@
  * needs the same semantics. The provider side (Python) implements the
  * identical rules — keep both in sync:
  *
- *   normalize: `lowercase(trim(raw))` must then match `^[a-z0-9_-]{1,64}$`
+ *   normalize: `lowercase(asciiTrim(raw))` must then match `^[a-z0-9_-]{1,64}$`
  *   in full, otherwise the id is invalid (null). Lowercase only — characters
  *   are NEVER stripped (fail-closed): an id like `wendy.li` is rejected
  *   outright rather than silently mapped onto `wendyli`.
+ *
+ *   Trim is ASCII-only (space, \t \n \v \f \r) on BOTH sides — JS `trim()`
+ *   and Python `strip()` would additionally eat Unicode whitespace such as
+ *   U+FEFF, silently accepting ids the other side rejects. Keep in sync with
+ *   `_normalize_user_id` (hermes-plugin/memory/memory_tencentdb/__init__.py).
  */
+
+/**
+ * Leading/trailing ASCII whitespace only (space + \t \n \v \f \r) — NOT
+ * `String.prototype.trim()`, which also strips Unicode whitespace (U+FEFF,
+ * U+00A0, …) and would diverge from the Python provider's `.strip(...)` pair.
+ */
+const ASCII_TRIM_RE = /^[ \t\r\n\f\v]+|[ \t\r\n\f\v]+$/g;
 
 /**
  * Valid uid shape after normalization. Full-string match, 1–64 chars of
@@ -25,11 +37,11 @@ export const DEFAULT_USER_ID = "default";
  * Normalize a raw user id.
  *
  * @returns the normalized id, or `null` when the input is not a string, is
- * empty after trim, or does not fully match `^[a-z0-9_-]{1,64}$`.
+ * empty after ASCII-trim, or does not fully match `^[a-z0-9_-]{1,64}$`.
  */
 export function normalizeUserId(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
-  const uid = raw.trim().toLowerCase();
+  const uid = raw.replace(ASCII_TRIM_RE, "").toLowerCase();
   if (!USER_ID_PATTERN.test(uid)) return null;
   return uid;
 }

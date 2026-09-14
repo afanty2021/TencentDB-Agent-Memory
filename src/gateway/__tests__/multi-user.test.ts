@@ -328,4 +328,79 @@ describe("TdaiGateway per-user core routing", () => {
       await gw2.stop();
     }
   });
+
+  it("evicts the least-recently-used core beyond 64 users: map entry gone, on-disk data kept, re-resolve works, WARN logged", async () => {
+    // Plan §7.2 scenario: the LRU bound reclaims in-memory handles only —
+    // `users/<uid>/` on disk is never touched, and a later request for an
+    // evicted user transparently re-creates the core over the same data.
+    const { gw, resolve, baseDir } = makeGateway({ enabled: true, ownerUserIds: [] });
+    const userCores = (gw as unknown as { userCores: Map<string, { core: TdaiCore }> }).userCores;
+    try {
+      // Give the first user (the future eviction victim) a durable marker.
+      const first = await resolve("u-000");
+      const capture = await first.handleTurnCommitted({
+        userText: "hello from sess-u-000",
+        assistantText: "hi there",
+        messages: [
+          { role: "user", content: "hello from sess-u-000" },
+          { role: "assistant", content: "hi there" },
+        ],
+        sessionKey: "sess-u-000",
+        startedAt: Date.now() - 60_000,
+      });
+      expect(capture.l0RecordedCount).toBeGreaterThan(0);
+
+      // Push past the LRU capacity: u-000 + 64 more = 65 cores created,
+      // so exactly one eviction fires (u-000 is the oldest by lastAccess).
+      for (let i = 1; i <= 64; i++) {
+        await resolve(`u-${String(i).padStart(3, "0")}`);
+      }
+
+      // Oldest core evicted from the map, capacity respected.
+      expect(userCores.has("u-000")).toBe(false);
+      expect(userCores.size).toBe(64);
+
+      // The eviction was announced with a WARN.
+      const evictWarn = warnSpy.mock.calls.find((call) => String(call[0]).includes("LRU evicted"));
+      expect(evictWarn).toBeTruthy();
+      expect(String(evictWarn![0])).toContain("uid=u-000");
+
+      // On-disk data (directory + captured L0 jsonl) survives eviction.
+      const firstUserDir = path.join(baseDir, "users", "u-000");
+      expect(fs.existsSync(firstUserDir)).toBe(true);
+      expect(readAllJsonl(path.join(firstUserDir, "conversations"))).toContain("sess-u-000");
+
+      // Let the background destroy (2s timeout race) settle before re-resolving.
+      await new Promise((r) => setTimeout(r, 250));
+
+      // Re-resolving the evicted uid works: a fresh core over the same data.
+      const again = await resolve("u-000");
+      expect(again).not.toBe(first);
+      expect(userCores.get("u-000")?.core).toBe(again);
+      expect(readAllJsonl(path.join(firstUserDir, "conversations"))).toContain("sess-u-000");
+    } finally {
+      await gw.stop();
+    }
+  }, 120_000);
+
+  it("dedups concurrent first requests across normalization: resolving 'w' and 'W' together yields one core, one initialization", async () => {
+    // Plan §7.2 scenario: two simultaneous first requests whose raw ids
+    // normalize to the same uid must share a single Map entry — no second
+    // TdaiCore, no second initialize() racing the first.
+    const { gw, resolve } = makeGateway({ enabled: true, ownerUserIds: [] });
+    const userCores = (gw as unknown as { userCores: Map<string, { core: TdaiCore }> }).userCores;
+    try {
+      const [viaW, viaCapW] = await Promise.all([resolve("w"), resolve("W")]);
+
+      // Shared identity — both raw ids got the SAME core instance.
+      expect(viaCapW).toBe(viaW);
+
+      // Exactly one entry, keyed by the normalized uid (one initialization).
+      expect(userCores.size).toBe(1);
+      expect(userCores.has("w")).toBe(true);
+      expect(userCores.get("w")?.core).toBe(viaW);
+    } finally {
+      await gw.stop();
+    }
+  });
 });

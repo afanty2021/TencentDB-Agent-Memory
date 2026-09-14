@@ -451,12 +451,13 @@ id 会先做归一化（`lowercase(trim(id))`），然后必须完整匹配 `^[a
         └── conversations/
 ```
 
-另外两点需要了解：
+另外三点需要了解：
 
 - **`POST /seed` 守卫。** seed 永远写入主库，因此多用户路由开启时，携带普通用户 `user_id` 的 seed 请求会被拒绝并返回 `403 {"error":"seed is not allowed for per-user stores"}`。要给主库灌历史数据，请省略 `user_id`（或使用 owner id）。
 - **后端限制。** 每用户隔离依赖上述本地 SQLite 目录布局。`storeBackend: "tcvdb"` 时所有存储都指向同一个远端 database/collection，与 `user_id` 无关——多用户路由请保持在默认 SQLite 后端上使用。
+- **回滚。** 把 `multiUser.enabled` 关回 `false` 不会删除任何数据：`users/<uid>/` 下已落盘的用户数据会完整保留，只是无法再通过主库访问（所有请求都落回主库）。重新开启开关即可恢复访问。
 
-信任边界一句话：Gateway 自身没有请求鉴权，`user_id` 是**调用方自行声明**的——多用户路由防的是误用，不是伪造；真正要隔离，请配合 `TDAI_GATEWAY_API_KEY` 与网络层访问控制。
+信任边界一句话：Gateway 自身没有**按用户**的鉴权——共享的可选 Bearer token（`TDAI_GATEWAY_API_KEY`）只认证客户端，不校验**调用者究竟是哪个用户**——所以 `user_id` 是**调用方自行声明**的：多用户路由防的是误用，不是伪造；真正要隔离，请配合 `TDAI_GATEWAY_API_KEY` 与网络层访问控制。
 
 ---
 

@@ -448,12 +448,13 @@ On-disk layout:
         └── conversations/
 ```
 
-Two more things to know:
+Three more things to know:
 
 - **`POST /seed` guard.** Seeding always writes to the main store, so while multi-user routing is enabled, a seed request carrying a regular user's `user_id` is refused with `403 {"error":"seed is not allowed for per-user stores"}`. Omit `user_id` (or use an owner id) to seed the main pool.
 - **Backend limitation.** Per-user isolation relies on the local SQLite layout above. With `storeBackend: "tcvdb"` every store targets the same remote database/collections regardless of `user_id` — keep multi-user routing on the default SQLite backend.
+- **Rolling back.** Turning `multiUser.enabled` back off deletes nothing: per-user data already on disk under `users/<uid>/` is preserved but becomes unreachable through the main pool (every request lands in the main store). Re-enabling the switch restores access to it.
 
-Trust boundary in one sentence: the Gateway has no request authentication, so `user_id` is **caller-declared** — multi-user routing prevents accidents, not forgery; for real isolation combine it with `TDAI_GATEWAY_API_KEY` and network-level access control.
+Trust boundary in one sentence: the Gateway has no **per-user** authentication — the shared optional Bearer token (`TDAI_GATEWAY_API_KEY`) authenticates the client, but nothing verifies *which* user is calling — so `user_id` is **caller-declared**; multi-user routing prevents accidents, not forgery. For real isolation combine it with `TDAI_GATEWAY_API_KEY` and network-level access control.
 
 ---
 

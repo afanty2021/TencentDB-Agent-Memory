@@ -317,16 +317,21 @@ def _coerce_limit(
 
 
 # Valid uid shape after normalization. Must stay in lockstep with the
-# Gateway's ``normalizeUserId`` (src/utils/user-id.ts): lowercase(trim(raw))
+# Gateway's ``normalizeUserId`` (src/utils/user-id.ts): lowercase(ascii-trim(raw))
 # fully matched against ^[a-z0-9_-]{1,64}$, else the id is invalid.
 _USER_ID_PATTERN = re.compile(r"^[a-z0-9_-]{1,64}$")
+
+# Leading/trailing ASCII whitespace only — NOT ``str.strip()`` without
+# arguments, which also strips Unicode whitespace (U+FEFF, U+00A0, …) and
+# would accept ids the Gateway's ASCII-only trim rejects.
+_ASCII_WHITESPACE = " \t\r\n\f\v"
 
 
 def _normalize_user_id(raw: Any) -> Optional[str]:
     """Normalize a raw user id with the Gateway's exact semantics.
 
     Mirrors ``normalizeUserId`` (src/utils/user-id.ts) so both sides accept
-    and reject the same ids: ``lowercase(trim(raw))`` must match
+    and reject the same ids: ``lowercase(ascii-trim(raw))`` must match
     ``^[a-z0-9_-]{1,64}$`` in full. Lowercase only — characters are NEVER
     stripped (fail-closed): ``"Wendy.Li"`` is rejected outright instead of
     being silently mapped onto ``"wendyli"`` (which would cross-contaminate
@@ -337,7 +342,7 @@ def _normalize_user_id(raw: Any) -> Optional[str]:
     """
     if not isinstance(raw, str):
         return None
-    uid = raw.strip().lower()
+    uid = raw.strip(_ASCII_WHITESPACE).lower()
     if not _USER_ID_PATTERN.fullmatch(uid):
         return None
     return uid

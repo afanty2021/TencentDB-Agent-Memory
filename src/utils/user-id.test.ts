@@ -31,6 +31,16 @@ describe("normalizeUserId", () => {
     expect(normalizeUserId("   ")).toBeNull();
   });
 
+  it("rejects Unicode-whitespace-padded ids (ASCII-only trim, paired with Python .strip(\" \\t\\r\\n\\f\\v\"))", () => {
+    // JS `trim()` would strip the U+FEFF byte-order mark and accept "wendy";
+    // Python's bare `strip()` would do the same. Both sides now trim ASCII
+    // whitespace only, so this must be REJECTED on both ends.
+    expect(normalizeUserId("\uFEFFwendy")).toBeNull();
+    expect(normalizeUserId("wendy\u00A0")).toBeNull();
+    // ASCII whitespace still trims.
+    expect(normalizeUserId("\t\nwendy\r\n")).toBe("wendy");
+  });
+
   it("rejects non-ASCII ids", () => {
     expect(normalizeUserId("王芳")).toBeNull();
     expect(normalizeUserId("wèndy")).toBeNull();

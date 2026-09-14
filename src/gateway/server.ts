@@ -286,16 +286,17 @@ export class TdaiGateway {
         `User core LRU evicted [uid=${oldestUid}] — userCores=${this.userCores.size}/${MAX_USER_CORES}; ` +
         `destroying in background (${USER_CORE_DESTROY_TIMEOUT_MS}ms timeout); on-disk data kept`,
       );
-      this.destroyUserCore(evicted);
+      this.destroyUserCore(oldestUid, evicted);
     }
   }
 
   /**
    * Destroy a per-user core, racing against a hard timeout. Fire-and-forget
-   * safe (all rejections swallowed after logging context is already carried
-   * by `core.destroy()` itself).
+   * safe: a destroy failure is logged as a WARN (the on-disk data and the
+   * next request's fresh core absorb it) and then swallowed so it can never
+   * produce an unhandled rejection.
    */
-  private destroyUserCore(entry: UserCoreEntry): Promise<void> {
+  private destroyUserCore(uid: string, entry: UserCoreEntry): Promise<void> {
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<void>((resolve) => {
       timeoutId = setTimeout(resolve, USER_CORE_DESTROY_TIMEOUT_MS);
@@ -305,7 +306,12 @@ export class TdaiGateway {
       .finally(() => {
         if (timeoutId !== undefined) clearTimeout(timeoutId);
       })
-      .catch(() => {});
+      .catch((err) => {
+        this.logger.warn(
+          `User core destroy failed [uid=${uid}]: ${err instanceof Error ? err.message : String(err)} ` +
+          "(on-disk data kept; a later request re-creates the core)",
+        );
+      });
   }
 
   /**
@@ -405,7 +411,7 @@ export class TdaiGateway {
     // so one stuck user store cannot hang the shutdown).
     if (this.userCores.size > 0) {
       await Promise.allSettled(
-        [...this.userCores.values()].map((entry) => this.destroyUserCore(entry)),
+        [...this.userCores.entries()].map(([uid, entry]) => this.destroyUserCore(uid, entry)),
       );
       this.userCores.clear();
     }
@@ -681,8 +687,9 @@ export class TdaiGateway {
     // multi-user routing is enabled, refuse seeds addressed to a regular
     // per-user store — history seeded into the shared pool would be readable
     // by the admin but invisible to the teacher it belongs to. Note: the
-    // gateway has no request-authentication, so `user_id` is caller-declared;
-    // this 403 guards against misuse, not forgery.
+    // gateway has no *per-user* authentication (the shared optional Bearer
+    // key authenticates the client, not which user is calling), so `user_id`
+    // is caller-declared; this 403 guards against misuse, not forgery.
     const seedRouting = resolveUserIdRouting(
       {
         multiUserEnabled: this.config.multiUser.enabled,
