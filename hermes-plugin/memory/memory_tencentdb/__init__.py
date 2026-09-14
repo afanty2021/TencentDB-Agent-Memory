@@ -379,10 +379,13 @@ MEMORY_SEARCH_SCHEMA = {
 CONVERSATION_SEARCH_SCHEMA = {
     "name": "memory_tencentdb_conversation_search",
     "description": (
-        "Search through past conversation history (raw dialogue records). "
-        "Use when memory_tencentdb_memory_search doesn't have the information "
-        "you need, or when you want to find specific past conversations or "
-        "exact words the user said before."
+        "Search past conversation history (raw dialogue records) when the current "
+        "context lacks details about prior interactions. Use it: when the user "
+        "references details of past conversations, decisions, or promises that you "
+        "cannot find in context; before asking the user to repeat something they "
+        "likely already said; when a compaction summary is too vague and you need "
+        "the original wording (especially after a CONTEXT COMPACTION marker); "
+        "before answering 'what did we say/discuss about X' questions."
     ),
     "parameters": {
         "type": "object",
@@ -893,7 +896,14 @@ class MemoryTencentdbProvider(MemoryProvider):
             context = result.get("context", "")
             self._record_success()
             if context:
-                return f"## memory-tencentdb Memory\n{context}"
+                return (
+                    "## memory-tencentdb Memory\n"
+                    f"{context}\n\n"
+                    "If the above is insufficient for questions about past "
+                    "conversations, call memory_tencentdb_conversation_search — "
+                    "earlier context may have been compacted, and the raw record "
+                    "is retrievable only here."
+                )
             return ""
         except Exception as e:
             self._record_failure()
