@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -315,6 +316,33 @@ def _coerce_limit(
     return value
 
 
+# Valid uid shape after normalization. Must stay in lockstep with the
+# Gateway's ``normalizeUserId`` (src/utils/user-id.ts): lowercase(trim(raw))
+# fully matched against ^[a-z0-9_-]{1,64}$, else the id is invalid.
+_USER_ID_PATTERN = re.compile(r"^[a-z0-9_-]{1,64}$")
+
+
+def _normalize_user_id(raw: Any) -> Optional[str]:
+    """Normalize a raw user id with the Gateway's exact semantics.
+
+    Mirrors ``normalizeUserId`` (src/utils/user-id.ts) so both sides accept
+    and reject the same ids: ``lowercase(trim(raw))`` must match
+    ``^[a-z0-9_-]{1,64}$`` in full. Lowercase only — characters are NEVER
+    stripped (fail-closed): ``"Wendy.Li"`` is rejected outright instead of
+    being silently mapped onto ``"wendyli"`` (which would cross-contaminate
+    two different users' stores).
+
+    Returns the normalized id, or ``None`` when ``raw`` is not a string, is
+    empty after trimming, or does not fully match the pattern.
+    """
+    if not isinstance(raw, str):
+        return None
+    uid = raw.strip().lower()
+    if not _USER_ID_PATTERN.fullmatch(uid):
+        return None
+    return uid
+
+
 # ---------------------------------------------------------------------------
 # Tool schemas
 # ---------------------------------------------------------------------------
@@ -385,6 +413,12 @@ class MemoryTencentdbProvider(MemoryProvider):
         self._client: Optional[MemoryTencentdbSdkClient] = None
         self._session_id = ""
         self._user_id = ""
+        # Per-turn user identity recorded by on_turn_start() (normalized, or
+        # None when the turn has no usable human author — bot turns, missing
+        # or invalid author id). It always wins over the static _user_id
+        # fallback so multi-user sessions attribute each turn to the person
+        # who actually sent it. See _effective_user_id().
+        self._current_user: Optional[str] = None
         self._gateway_available = False
         self._initialized = False  # Track if initialize() has been called
 
@@ -854,7 +888,7 @@ class MemoryTencentdbProvider(MemoryProvider):
             result = self._client.recall(
                 query=query,
                 session_key=effective_session,
-                user_id=self._user_id,
+                user_id=self._effective_user_id() or "",
             )
             context = result.get("context", "")
             self._record_success()
@@ -874,8 +908,21 @@ class MemoryTencentdbProvider(MemoryProvider):
         """No-op — recall is done synchronously in prefetch()."""
         pass
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        turn_author: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Send the turn to Gateway for capture (non-blocking).
+
+        ``turn_author`` is the per-turn author snapshot Hermes passes when the
+        provider's signature accepts it (same ``{"id", "name", "is_bot"}``
+        shape as the ``on_turn_start`` kwargs). Its id is snapshotted HERE, at
+        call time — never re-read from ``self._current_user`` inside the
+        background thread, which by then may already describe the NEXT turn.
 
         Threading model:
           * Each call spawns a daemon thread that performs one ``capture``.
@@ -900,13 +947,22 @@ class MemoryTencentdbProvider(MemoryProvider):
         effective_session = session_id or self._session_id
         client = self._client
 
+        # Capture attribution, resolved eagerly (chain step 1): a non-bot,
+        # valid turn_author id wins; anything else falls back to the
+        # on_turn_start-recorded identity and the static fallback
+        # (steps 2/3), or "" to omit the field (step 4).
+        turn_author_uid = None
+        if isinstance(turn_author, dict) and not turn_author.get("is_bot"):
+            turn_author_uid = _normalize_user_id(turn_author.get("id"))
+        capture_uid = turn_author_uid or self._effective_user_id() or ""
+
         def _sync():
             try:
                 client.capture(
                     user_content=user_content,
                     assistant_content=assistant_content,
                     session_key=effective_session,
-                    user_id=self._user_id,
+                    user_id=capture_uid,
                 )
                 self._record_success()
             except Exception as e:
@@ -978,7 +1034,7 @@ class MemoryTencentdbProvider(MemoryProvider):
             try:
                 self._client.end_session(
                     session_key=self._session_id,
-                    user_id=self._user_id,
+                    user_id=self._effective_user_id() or "",
                 )
             except Exception as e:
                 logger.debug("memory-tencentdb session end failed: %s", e)
@@ -1036,6 +1092,7 @@ class MemoryTencentdbProvider(MemoryProvider):
                     query=query,
                     limit=_coerce_limit(args.get("limit")),
                     type_filter=args.get("type", ""),
+                    user_id=self._effective_user_id() or "",
                 )
                 self._record_success()
                 return json.dumps(result)
@@ -1047,6 +1104,7 @@ class MemoryTencentdbProvider(MemoryProvider):
                 result = self._client.search_conversations(
                     query=query,
                     limit=_coerce_limit(args.get("limit")),
+                    user_id=self._effective_user_id() or "",
                 )
                 self._record_success()
                 return json.dumps(result)
@@ -1059,6 +1117,54 @@ class MemoryTencentdbProvider(MemoryProvider):
             # returned to the LLM below is unchanged.
             self._try_recover_gateway()
             return json.dumps({"error": f"Tool call failed: {e}"})
+
+    # -- Per-turn identity ------------------------------------------------------
+    #
+    # The Gateway routes every request to a per-user store based on the
+    # ``user_id`` field, so capture/recall/search/end_session must all send
+    # the identity of the user who is actually talking THIS turn, not
+    # whoever opened the session. One authoritative priority chain:
+    #
+    #   1. ``sync_turn``'s ``turn_author.id`` snapshot (write path)
+    #   2. ``self._current_user`` (recorded by on_turn_start)
+    #   3. ``self._user_id``  (static fallback injected via initialize)
+    #   4. none of the above  → omit the user_id field entirely (the
+    #      Gateway then routes to the default pool)
+
+    def _effective_user_id(self) -> Optional[str]:
+        """Current read-path identity: per-turn user, else the static fallback.
+
+        Returns ``None`` when neither is set, which callers must translate to
+        "omit the user_id field" (the client methods do this themselves).
+        """
+        return self._current_user or self._user_id or None
+
+    def on_turn_start(
+        self,
+        turn_count: int,
+        query: str,
+        author_id: Optional[str] = None,
+        author_name: Optional[str] = None,
+        author_is_bot: bool = False,
+    ) -> None:
+        """Record the per-turn user identity for capture/recall attribution.
+
+        Hermes' ``MemoryManager.on_turn_start`` fans this hook out to every
+        provider, passing the *turn author* kwargs filtered by provider
+        signature — declaring ``author_id``/``author_name``/``author_is_bot``
+        is what makes them arrive.
+
+        Fail-closed rule: a bot-authored turn, or a turn whose author id is
+        missing or fails :func:`_normalize_user_id`, CLEARS the recorded
+        identity (``None``) so capture/recall fall back down the chain
+        instead of attributing this turn to the previous speaker.
+        """
+        # turn_count / query / author_name are part of the Hermes contract
+        # but carry no identity this provider needs.
+        if author_is_bot or not author_id:
+            self._current_user = None
+            return
+        self._current_user = _normalize_user_id(author_id)
 
     # -- Optional hooks -------------------------------------------------------
 
@@ -1074,7 +1180,7 @@ class MemoryTencentdbProvider(MemoryProvider):
             try:
                 self._client.end_session(
                     session_key=self._session_id,
-                    user_id=self._user_id,
+                    user_id=self._effective_user_id() or "",
                 )
             except Exception as e:
                 logger.debug("memory-tencentdb on_session_end failed: %s", e)
