@@ -789,6 +789,13 @@ class MemoryTencentdbProvider(MemoryProvider):
             Gateway is ready.
         """
         self._session_id = session_id
+        # Static session-owner fallback. Deliberately NOT normalized here:
+        # the Gateway is the normalization authority — it lowercases,
+        # ASCII-trims and fail-closes this value at routing time, so a
+        # client-side rewrite would only duplicate (and potentially drift
+        # from) that rule. Unlike the per-turn chain below, no local
+        # decision depends on this id's validity, so it passes through
+        # verbatim.
         self._user_id = kwargs.get("user_id", "default")
 
         host = _resolve_gateway_host()

@@ -22,7 +22,7 @@ import { TdaiCore } from "../core/tdai-core.js";
 import { StandaloneHostAdapter } from "../adapters/standalone/host-adapter.js";
 import { loadGatewayConfig } from "./config.js";
 import type { GatewayConfig } from "./config.js";
-import { initDataDirectories } from "../utils/pipeline-factory.js";
+import { initDataDirectories, resetStores } from "../utils/pipeline-factory.js";
 import { SessionFilter } from "../utils/session-filter.js";
 import { resolveUserIdRouting } from "../utils/user-id.js";
 import type {
@@ -214,13 +214,19 @@ export class TdaiGateway {
     return this.core;
   }
 
+  /** Per-user data directory: `<baseDir>/users/<uid>/`. */
+  private userCoreDataDir(uid: string): string {
+    // uid is validated (`^[a-z0-9_-]{1,64}$`), so this path cannot traverse.
+    return path.join(this.config.data.baseDir, "users", uid);
+  }
+
   /**
    * Get (lazily creating) the per-user core entry for a normalized uid.
    * Returns the entry (core + shared `initialize()` promise) rather than the
    * bare core so callers can await readiness — see {@link _resolveCore}.
    *
    * Each user gets its own `StandaloneHostAdapter` + `TdaiCore` rooted at
-   * `<baseDir>/users/<uid>/` — `initStores` caches per dataDir, so a distinct
+   * {@link userCoreDataDir} — `initStores` caches per dataDir, so a distinct
    * directory yields a fully isolated memory stack (vectors.db, L0 jsonl,
    * persona, scene blocks, checkpoints). Concurrent first requests for the
    * same uid share one initialization via the Map entry (promise dedup).
@@ -232,8 +238,7 @@ export class TdaiGateway {
       return existing;
     }
 
-    // uid is validated (`^[a-z0-9_-]{1,64}$`), so this path cannot traverse.
-    const dataDir = path.join(this.config.data.baseDir, "users", uid);
+    const dataDir = this.userCoreDataDir(uid);
     const adapter = new StandaloneHostAdapter({
       dataDir,
       llmConfig: this.config.llm,
@@ -250,8 +255,11 @@ export class TdaiGateway {
     this.userCores.set(uid, entry);
     this.logger.info(`User core created [uid=${uid}] dataDir=${dataDir} (${this.userCores.size}/${MAX_USER_CORES})`);
 
-    // initialize() only rejects on unexpected failures (e.g. unwritable
-    // dataDir); drop the entry so the next request retries cleanly.
+    // Store-level init failures are swallowed inside TdaiCore (degraded mode:
+    // empty searches, captures fall back to JSONL) and the entry is KEPT —
+    // the promise only rejects on unexpected errors (e.g. unwritable
+    // dataDir), in which case the entry is dropped so the next request
+    // retries cleanly.
     entry.ready.catch((err) => {
       this.logger.error(`User core init failed [uid=${uid}]: ${err instanceof Error ? err.message : String(err)}`);
       if (this.userCores.get(uid) === entry) this.userCores.delete(uid);
@@ -267,6 +275,14 @@ export class TdaiGateway {
    * background (raced against {@link USER_CORE_DESTROY_TIMEOUT_MS}) so a
    * stuck destroy never blocks request handling; eviction persists
    * checkpoints and keeps the on-disk data.
+   *
+   * Before starting the background destroy, the shared store-init cache
+   * entry for the evicted user's dataDir is dropped **synchronously**
+   * (`resetStores`). `TdaiCore.destroy()` only clears that cache at its
+   * very end — doing it only there would leave a window (the destroy
+   * drain period) in which a same-uid request creates a fresh core whose
+   * `initialize()` hits the cached init promise and silently inherits
+   * store handles the in-flight destroy is about to close.
    */
   private evictUserCoresIfNeeded(): void {
     while (this.userCores.size > MAX_USER_CORES) {
@@ -282,6 +298,9 @@ export class TdaiGateway {
 
       const evicted = this.userCores.get(oldestUid)!;
       this.userCores.delete(oldestUid);
+      // Synchronously close the rebuild window — must happen BEFORE the
+      // background destroy starts (see docstring above).
+      resetStores(this.userCoreDataDir(oldestUid));
       this.logger.warn(
         `User core LRU evicted [uid=${oldestUid}] — userCores=${this.userCores.size}/${MAX_USER_CORES}; ` +
         `destroying in background (${USER_CORE_DESTROY_TIMEOUT_MS}ms timeout); on-disk data kept`,

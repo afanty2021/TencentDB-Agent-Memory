@@ -434,7 +434,7 @@ export MEMORY_TENCENTDB_GATEWAY_API_KEY="<与 Gateway 同一份密钥>"
 
 路由规则按顺序判定：开关关闭 → 主库；`user_id` 缺失或不合法 → 主库（fail-closed，并打印告警）；owner id → 主库；遗留兜底 id `default` → 主库；其余合法 id → 各自的 `users/<uid>/` 独立库。
 
-id 会先做归一化（`lowercase(trim(id))`），然后必须完整匹配 `^[a-z0-9_-]{1,64}$`。匹配是全有或全无——**绝不**剔除字符——所以 `wendy.li` 会被整体拒绝进主库，而不是被悄悄改写成 `wendyli` 造成两个用户的记忆串库。受限字符集同时也保证了 `users/<uid>/` 路径无法目录穿越。
+id 会先做归一化（`lowercase(ascii-trim(id))`——只剔除首尾的 **ASCII 空白**；U+FEFF 等 Unicode 空白故意不剔除，保证 TS 与 Python 两侧行为完全一致），然后必须完整匹配 `^[a-z0-9_-]{1,64}$`。匹配是全有或全无——**绝不**剔除字符——所以 `wendy.li` 会被整体拒绝进主库，而不是被悄悄改写成 `wendyli` 造成两个用户的记忆串库。受限字符集同时也保证了 `users/<uid>/` 路径无法目录穿越。
 
 磁盘目录布局：
 
@@ -451,8 +451,10 @@ id 会先做归一化（`lowercase(trim(id))`），然后必须完整匹配 `^[a
         └── conversations/
 ```
 
-另外三点需要了解：
+另外几点需要了解：
 
+- **`GET /health` 只反映主 core。** 该探针只汇报主存储的初始化状态；某个 per-user core 降级只会影响它自己的路由，不会把 `/health` 打成不健康。
+- **混合版本升级。** 先升级 Gateway、后升级 provider 是安全顺序。尚未发送 `user_id` 的旧 provider 会把所有请求落到主库——与多用户功能上线前的行为完全一致，不会误路由、不会丢数据；provider 升级完成后各用户库会自动恢复写入。
 - **`POST /seed` 守卫。** seed 永远写入主库，因此多用户路由开启时，携带普通用户 `user_id` 的 seed 请求会被拒绝并返回 `403 {"error":"seed is not allowed for per-user stores"}`。要给主库灌历史数据，请省略 `user_id`（或使用 owner id）。
 - **后端限制。** 每用户隔离依赖上述本地 SQLite 目录布局。`storeBackend: "tcvdb"` 时所有存储都指向同一个远端 database/collection，与 `user_id` 无关——多用户路由请保持在默认 SQLite 后端上使用。
 - **回滚。** 把 `multiUser.enabled` 关回 `false` 不会删除任何数据：`users/<uid>/` 下已落盘的用户数据会完整保留，只是无法再通过主库访问（所有请求都落回主库）。重新开启开关即可恢复访问。

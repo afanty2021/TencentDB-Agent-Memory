@@ -431,7 +431,7 @@ By default the Gateway keeps **one** shared memory store. With multi-user routin
 
 Routing rules, in order: switch off → main store; missing or invalid `user_id` → main store (fail-closed, logged as a warning); owner id → main store; the legacy fallback id `default` → main store; any other valid id → its own store under `users/<uid>/`.
 
-Ids are normalized (`lowercase(trim(id))`) and must fully match `^[a-z0-9_-]{1,64}$`. Matching is all-or-nothing — characters are **never** stripped — so `wendy.li` is rejected to the main store rather than silently merged into `wendyli`. The restricted alphabet also makes `users/<uid>/` paths impossible to traverse.
+Ids are normalized (`lowercase(ascii-trim(id))` — leading/trailing **ASCII whitespace only**; Unicode whitespace like U+FEFF is deliberately not trimmed so both the TS and Python implementations accept/reject identically) and must fully match `^[a-z0-9_-]{1,64}$`. Matching is all-or-nothing — characters are **never** stripped — so `wendy.li` is rejected to the main store rather than silently merged into `wendyli`. The restricted alphabet also makes `users/<uid>/` paths impossible to traverse.
 
 On-disk layout:
 
@@ -448,8 +448,10 @@ On-disk layout:
         └── conversations/
 ```
 
-Three more things to know:
+More things to know:
 
+- **`GET /health` reflects the main core only.** The probe reports the main store's init state; a degraded per-user core degrades only its own routes and never flips `/health`.
+- **Mixed-version upgrades.** Upgrade the Gateway first, then the provider — that order is safe. An old provider that does not yet send `user_id` on searches simply lands everything in the main store, exactly like the pre-multi-user behaviour; nothing is misrouted or lost, and per-user stores fill up again once the provider is upgraded.
 - **`POST /seed` guard.** Seeding always writes to the main store, so while multi-user routing is enabled, a seed request carrying a regular user's `user_id` is refused with `403 {"error":"seed is not allowed for per-user stores"}`. Omit `user_id` (or use an owner id) to seed the main pool.
 - **Backend limitation.** Per-user isolation relies on the local SQLite layout above. With `storeBackend: "tcvdb"` every store targets the same remote database/collections regardless of `user_id` — keep multi-user routing on the default SQLite backend.
 - **Rolling back.** Turning `multiUser.enabled` back off deletes nothing: per-user data already on disk under `users/<uid>/` is preserved but becomes unreachable through the main pool (every request lands in the main store). Re-enabling the switch restores access to it.

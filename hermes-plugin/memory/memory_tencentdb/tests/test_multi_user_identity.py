@@ -25,6 +25,7 @@ Node processes nor open network sockets (same style as the recovery suite).
 
 from __future__ import annotations
 
+import inspect
 import json
 import threading
 import time
@@ -123,6 +124,43 @@ def provider_with_fake_supervisor(monkeypatch, fast_watchdog):
         yield provider
     finally:
         provider.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# signature probe: Hermes filters hook kwargs by the provider's signature
+# ---------------------------------------------------------------------------
+
+
+def test_on_turn_start_signature_declares_author_trio_explicitly():
+    """Hermes' MemoryManager inspects the provider signature and only fans out
+    the author kwargs it explicitly declares. If a future refactor renames one
+    of these parameters — or swallows them into ``**kwargs`` — the identity
+    would silently degrade to the static fallback id (every user mixed into
+    one pool) while every behavioural test above stays green. This probe makes
+    that rename fail loudly instead."""
+    params = inspect.signature(MemoryTencentdbProvider.on_turn_start).parameters
+    for name in ("author_id", "author_name", "author_is_bot"):
+        assert name in params, (
+            f"on_turn_start must explicitly declare '{name}': Hermes passes "
+            "author kwargs only when the provider signature names them"
+        )
+    for name, param in params.items():
+        assert param.kind is not inspect.Parameter.VAR_KEYWORD, (
+            f"parameter '{name}' must not be **kwargs: Hermes filters by "
+            "explicit parameter names, so **kwargs silently receives nothing"
+        )
+
+
+def test_sync_turn_signature_declares_turn_author():
+    """``turn_author`` must remain an explicit (keyword-only) sync_turn
+    parameter for the same reason: the per-turn capture attribution chain
+    starts with Hermes passing this kwarg by name."""
+    params = inspect.signature(MemoryTencentdbProvider.sync_turn).parameters
+    assert "turn_author" in params, (
+        "sync_turn must explicitly declare 'turn_author': Hermes passes it "
+        "only when the provider signature names it"
+    )
+    assert params["turn_author"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 # ---------------------------------------------------------------------------

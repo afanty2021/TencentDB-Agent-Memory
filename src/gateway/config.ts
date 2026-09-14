@@ -355,8 +355,10 @@ function resolveCorsOrigins(serverConfig: Record<string, unknown>): string[] {
  *   env: `TDAI_MULTI_USER_OWNERS="userA,userB"`
  *
  * Every entry is normalized via `normalizeUserId`; invalid entries are
- * silently dropped, duplicates de-duplicated, so the runtime can trust the
- * list to contain only valid uids.
+ * dropped with a one-line stderr WARN (they are usually operator typos —
+ * silently ignoring them would send an "owner" to a per-user store),
+ * duplicates de-duplicated, so the runtime can trust the list to contain
+ * only valid uids.
  */
 function resolveMultiUser(src: Record<string, unknown>): GatewayConfig["multiUser"] {
   // 1. enabled — env first (scalar precedence, like apiKey/port).
@@ -385,13 +387,23 @@ function resolveMultiUser(src: Record<string, unknown>): GatewayConfig["multiUse
   }
 
   // 3. Normalize + de-duplicate; invalid entries are dropped (fail-closed).
-  const ownerUserIds = [...new Set(
-    rawOwners
-      .map(o => normalizeUserId(o))
-      .filter((o): o is string => o !== null),
-  )];
+  const ownerUserIds: string[] = [];
+  for (const raw of rawOwners) {
+    const normalized = normalizeUserId(raw);
+    if (normalized === null) {
+      // Stderr-only — no logger exists at config-load time. Quoting the raw
+      // entry verbatim is safe here (operator config, not attacker-controlled
+      // request input, unlike the type/length-only user_id routing WARN).
+      process.stderr.write(
+        `[tdai-gateway] WARN: dropping invalid multiUser.ownerUserIds entry ` +
+        `(${JSON.stringify(raw)} does not match ^[a-z0-9_-]{1,64}$ after normalization)\n`,
+      );
+      continue;
+    }
+    ownerUserIds.push(normalized);
+  }
 
-  return { enabled, ownerUserIds };
+  return { enabled, ownerUserIds: [...new Set(ownerUserIds)] };
 }
 
 /**

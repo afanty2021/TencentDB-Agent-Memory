@@ -20,6 +20,7 @@ import { TdaiGateway } from "../server.js";
 const tmpRoots: string[] = [];
 let tmpRoot = "";
 let warnSpy: ReturnType<typeof vi.spyOn>;
+let stderrSpy: ReturnType<typeof vi.spyOn>;
 
 function makeTmpRoot(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tdai-multi-user-"));
@@ -42,6 +43,8 @@ beforeEach(() => {
   vi.spyOn(console, "info").mockImplementation(() => {});
   warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
   vi.spyOn(console, "error").mockImplementation(() => {});
+  // Config-load WARNs go to raw stderr (no logger exists yet) — same deal.
+  stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 });
 
 afterAll(() => {
@@ -120,6 +123,10 @@ describe("multiUser config loading", () => {
     const cfg = loadGatewayConfig();
     expect(cfg.multiUser.enabled).toBe(true);
     expect(cfg.multiUser.ownerUserIds).toEqual(["huangzhengbo", "wang", "dup"]);
+    // The dropped invalid entry is announced (operator typo visibility).
+    const dropWarn = stderrSpy.mock.calls.find((call) => String(call[0]).includes("dropping invalid multiUser.ownerUserIds entry"));
+    expect(dropWarn).toBeTruthy();
+    expect(String(dropWarn![0])).toContain("wendy.li");
   });
 
   it("reads yaml multiUser.enabled / multiUser.ownerUserIds", () => {
@@ -370,13 +377,27 @@ describe("TdaiGateway per-user core routing", () => {
       expect(fs.existsSync(firstUserDir)).toBe(true);
       expect(readAllJsonl(path.join(firstUserDir, "conversations"))).toContain("sess-u-000");
 
-      // Let the background destroy (2s timeout race) settle before re-resolving.
-      await new Promise((r) => setTimeout(r, 250));
-
-      // Re-resolving the evicted uid works: a fresh core over the same data.
+      // Re-resolve IMMEDIATELY — while the background destroy (2s timeout
+      // race) may still be draining. Eviction must reset the shared
+      // store-init cache synchronously BEFORE the destroy starts, so the
+      // fresh core cannot inherit store handles that destroy is about to
+      // close. (The old test slept 250ms here, which masked exactly this
+      // rebuild-window race.)
       const again = await resolve("u-000");
       expect(again).not.toBe(first);
       expect(userCores.get("u-000")?.core).toBe(again);
+
+      // The fresh core is usable right away: its store holds the surviving
+      // data (a stale/closed store handle would make this fail or degrade).
+      // Polled because the capture path defers the L0 index write to a
+      // background task — visibility is eventual even over a healthy store.
+      const deadline = Date.now() + 5_000;
+      let search = await again.searchConversations({ query: "hello from sess-u-000" });
+      while (search.total === 0 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50));
+        search = await again.searchConversations({ query: "hello from sess-u-000" });
+      }
+      expect(search.total).toBeGreaterThan(0);
       expect(readAllJsonl(path.join(firstUserDir, "conversations"))).toContain("sess-u-000");
     } finally {
       await gw.stop();

@@ -41,6 +41,10 @@ export const DEFAULT_USER_ID = "default";
  */
 export function normalizeUserId(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
+  // `.toLowerCase()` folds exotic code points too — notably U+212A (KELVIN
+  // SIGN) → ASCII "k". The Python provider's `str.lower()` behaves the same,
+  // so both sides accept/identically-normalize such ids; no extra guarding
+  // needed (recorded here so a future "fix" doesn't break the parity).
   const uid = raw.replace(ASCII_TRIM_RE, "").toLowerCase();
   if (!USER_ID_PATTERN.test(uid)) return null;
   return uid;

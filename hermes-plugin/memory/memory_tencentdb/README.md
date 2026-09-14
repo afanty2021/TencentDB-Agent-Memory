@@ -320,7 +320,8 @@ the person who actually sent it. Every capture / recall / search / session-end
 call resolves `user_id` through one authoritative chain:
 
 ```text
-turn author id (snapshot taken when sync_turn / prefetch was called)
+turn author id (capture attribution is frozen from turn_author.id at the
+  moment sync_turn() is called)
   → normalize: lowercase(trim(id)), must fully match ^[a-z0-9_-]{1,64}$
   → else the static user_id given to initialize() (Hermes session owner)
   → else omit the field entirely (Gateway routes to the main store)
@@ -329,9 +330,10 @@ turn author id (snapshot taken when sync_turn / prefetch was called)
 - `on_turn_start` records the normalized turn author and **clears** it on bot
   turns or missing/invalid author ids (fail-closed), so a turn is never
   attributed to the previous speaker.
-- Background capture threads use the snapshot taken at call time — they never
-  re-read the mutable per-turn identity, which the next turn may already have
-  overwritten.
+- Background capture threads carry the `turn_author` snapshot resolved when
+  `sync_turn()` was called — they never re-read the mutable per-turn identity,
+  which the next turn may already have overwritten. `prefetch()` needs no
+  snapshot: it is synchronous and resolves the current identity at call time.
 - `user_id` is caller-declared: multi-user routing prevents accidents, not
   forgery. Pair the Gateway with `TDAI_GATEWAY_API_KEY` and network-level
   access control when isolation matters.
