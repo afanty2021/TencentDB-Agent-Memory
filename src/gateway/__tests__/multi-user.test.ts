@@ -68,7 +68,7 @@ function captureOnlyMemoryConfig(): MemoryTdaiConfig {
 
 interface TestGateway {
   gw: TdaiGateway;
-  resolve: (raw: unknown) => TdaiCore;
+  resolve: (raw: unknown) => Promise<TdaiCore>;
   baseDir: string;
 }
 
@@ -79,8 +79,8 @@ function makeGateway(multiUser: GatewayConfig["multiUser"]): TestGateway {
     multiUser,
     memory: captureOnlyMemoryConfig(),
   });
-  const resolve = (gw as unknown as { _resolveCore: (raw: unknown) => TdaiCore })._resolveCore
-    .bind(gw) as (raw: unknown) => TdaiCore;
+  const resolve = (gw as unknown as { _resolveCore: (raw: unknown) => Promise<TdaiCore> })._resolveCore
+    .bind(gw) as (raw: unknown) => Promise<TdaiCore>;
   return { gw, resolve, baseDir };
 }
 
@@ -157,19 +157,19 @@ describe("TdaiGateway per-user core routing", () => {
   it("routes regular users to lazily-created cores rooted at <baseDir>/users/<uid>", async () => {
     const { gw, resolve, baseDir } = makeGateway({ enabled: true, ownerUserIds: ["huangzhengbo"] });
     try {
-      const mainCore = resolve(undefined);
-      const wendy = resolve("Wendy");
+      const mainCore = await resolve(undefined);
+      const wendy = await resolve("Wendy");
 
       expect(wendy).toBeInstanceOf(TdaiCore);
       expect(wendy).not.toBe(mainCore);
 
       // Normalized uid variants share one core (Map dedup + promise dedup).
-      expect(resolve("wendy")).toBe(wendy);
-      expect(resolve("  WENDY  ")).toBe(wendy);
+      expect(await resolve("wendy")).toBe(wendy);
+      expect(await resolve("  WENDY  ")).toBe(wendy);
 
       // A second user gets her own core.
-      expect(resolve("li-hua")).not.toBe(wendy);
-      expect(resolve("li-hua")).not.toBe(mainCore);
+      expect(await resolve("li-hua")).not.toBe(wendy);
+      expect(await resolve("li-hua")).not.toBe(mainCore);
 
       // Per-user data layout: <baseDir>/users/<uid>/ (initialize() creates it).
       expect(fs.existsSync(path.join(baseDir, "users", "wendy"))).toBe(true);
@@ -182,14 +182,14 @@ describe("TdaiGateway per-user core routing", () => {
   it("keeps owner / 'default' alias / invalid / missing uids on the main core", async () => {
     const { gw, resolve, baseDir } = makeGateway({ enabled: true, ownerUserIds: ["huangzhengbo"] });
     try {
-      const mainCore = resolve(undefined);
-      expect(resolve("huangzhengbo")).toBe(mainCore);
-      expect(resolve("HuangZhengBo")).toBe(mainCore);
-      expect(resolve("default")).toBe(mainCore);
-      expect(resolve("wendy.li")).toBe(mainCore); // fail-closed, no stripping
-      expect(resolve("../etc/passwd")).toBe(mainCore);
-      expect(resolve(42)).toBe(mainCore);
-      expect(resolve("")).toBe(mainCore);
+      const mainCore = await resolve(undefined);
+      expect(await resolve("huangzhengbo")).toBe(mainCore);
+      expect(await resolve("HuangZhengBo")).toBe(mainCore);
+      expect(await resolve("default")).toBe(mainCore);
+      expect(await resolve("wendy.li")).toBe(mainCore); // fail-closed, no stripping
+      expect(await resolve("../etc/passwd")).toBe(mainCore);
+      expect(await resolve(42)).toBe(mainCore);
+      expect(await resolve("")).toBe(mainCore);
 
       // None of the above may create a per-user directory.
       expect(fs.existsSync(path.join(baseDir, "users"))).toBe(false);
@@ -201,11 +201,11 @@ describe("TdaiGateway per-user core routing", () => {
   it("warns on normalization rejection, silently for owner and 'default'", async () => {
     const { gw, resolve } = makeGateway({ enabled: true, ownerUserIds: ["huangzhengbo"] });
     try {
-      resolve("huangzhengbo");
-      resolve("default");
+      await resolve("huangzhengbo");
+      await resolve("default");
       expect(warnSpy).not.toHaveBeenCalled();
 
-      resolve("wendy.li");
+      await resolve("wendy.li");
       expect(warnSpy).toHaveBeenCalledTimes(1);
       expect(String(warnSpy.mock.calls[0]?.[0])).toContain("Invalid or missing user_id");
     } finally {
@@ -216,10 +216,10 @@ describe("TdaiGateway per-user core routing", () => {
   it("routes everything to the main core when the feature is off", async () => {
     const { gw, resolve, baseDir } = makeGateway({ enabled: false, ownerUserIds: [] });
     try {
-      const mainCore = resolve(undefined);
-      expect(resolve("wendy")).toBe(mainCore);
-      expect(resolve("wendy.li")).toBe(mainCore);
-      expect(resolve("Wendy")).toBe(mainCore);
+      const mainCore = await resolve(undefined);
+      expect(await resolve("wendy")).toBe(mainCore);
+      expect(await resolve("wendy.li")).toBe(mainCore);
+      expect(await resolve("Wendy")).toBe(mainCore);
       expect(fs.existsSync(path.join(baseDir, "users"))).toBe(false);
     } finally {
       await gw.stop();
@@ -229,8 +229,8 @@ describe("TdaiGateway per-user core routing", () => {
   it("isolates per-user stores: each user's capture lands only in its own directory", async () => {
     const { gw, resolve, baseDir } = makeGateway({ enabled: true, ownerUserIds: [] });
     try {
-      const wendy = resolve("wendy");
-      const lihua = resolve("li-hua");
+      const wendy = await resolve("wendy");
+      const lihua = await resolve("li-hua");
 
       // startedAt in the past: L0 only records messages strictly newer than
       // the per-session cursor floor (= startedAt on first capture), and
@@ -269,8 +269,8 @@ describe("TdaiGateway per-user core routing", () => {
 
   it("stop() destroys every live per-user core", async () => {
     const { gw, resolve } = makeGateway({ enabled: true, ownerUserIds: [] });
-    const wendy = resolve("wendy");
-    const lihua = resolve("li-hua");
+    const wendy = await resolve("wendy");
+    const lihua = await resolve("li-hua");
     const wendyDestroy = vi.spyOn(wendy, "destroy");
     const lihuaDestroy = vi.spyOn(lihua, "destroy");
 
@@ -278,5 +278,54 @@ describe("TdaiGateway per-user core routing", () => {
 
     expect(wendyDestroy).toHaveBeenCalled();
     expect(lihuaDestroy).toHaveBeenCalled();
+  });
+
+  it("awaits user-core initialization: a first-request search on a cold core is not the empty-results degradation", async () => {
+    // TdaiCore.searchConversations/searchMemories do not await store readiness
+    // internally — they degrade to {results: [], total: 0} when the
+    // vectorStore is still undefined. _resolveCore must therefore await the
+    // shared initialize() promise before handing the core to handlers.
+    const baseDir = path.join(tmpRoot, `gw-${++gwCounter}`);
+    const make = () =>
+      new TdaiGateway({
+        data: { baseDir },
+        multiUser: { enabled: true, ownerUserIds: [] },
+        memory: captureOnlyMemoryConfig(),
+      });
+    const startedAt = Date.now() - 60_000;
+
+    // Gateway 1: capture data for wendy, then stop — destroy() closes the
+    // store and resets the per-dataDir store cache, so gateway 2 starts cold.
+    const gw1 = make();
+    const wendy1 = await (gw1 as unknown as { _resolveCore: (raw: unknown) => Promise<TdaiCore> })
+      ._resolveCore.bind(gw1)("wendy");
+    const capture = await wendy1.handleTurnCommitted({
+      userText: "hello from sess-wendy-cold",
+      assistantText: "hi there",
+      messages: [
+        { role: "user", content: "hello from sess-wendy-cold" },
+        { role: "assistant", content: "hi there" },
+      ],
+      sessionKey: "sess-wendy-cold",
+      startedAt,
+    });
+    expect(capture.l0RecordedCount).toBeGreaterThan(0);
+    await gw1.stop();
+
+    // Gateway 2 (same baseDir, empty userCores): wendy's FIRST request is a
+    // search on a cold core. Before the fix the search ran before store init
+    // completed and returned the {total: 0, strategy: "none"} degradation.
+    const gw2 = make();
+    try {
+      const wendy2 = await (gw2 as unknown as { _resolveCore: (raw: unknown) => Promise<TdaiCore> })
+        ._resolveCore.bind(gw2)("wendy");
+      expect(wendy2).not.toBe(wendy1); // fresh cold core, not the warmed one
+      expect(wendy2.getVectorStore()).toBeDefined(); // store ready before search
+
+      const result = await wendy2.searchConversations({ query: "hello from sess-wendy-cold" });
+      expect(result.total).toBeGreaterThan(0);
+    } finally {
+      await gw2.stop();
+    }
   });
 });

@@ -174,12 +174,19 @@ export class TdaiGateway {
    *   1. multi-user disabled / invalid uid / owner / "default" → main core
    *   2. otherwise (normalized uid)                            → per-user core
    *
+   * For per-user cores the shared `initialize()` promise is awaited before
+   * the core is handed out: TdaiCore's search methods do NOT wait for store
+   * readiness internally (recall/capture/session-end do), so a user's first
+   * request being a search would otherwise race store initialization and
+   * degrade to empty results. On init failure the core still degrades
+   * gracefully (empty searches, captures fall back to JSONL).
+   *
    * Invalid-or-missing uids additionally emit a normalization-rejection WARN
    * (monitored; the gradual-rollout exit criterion is a count of zero).
    * The raw value is never logged verbatim — only its type/length — to keep
    * junk input out of the logs.
    */
-  private _resolveCore(rawUserId: unknown): TdaiCore {
+  private async _resolveCore(rawUserId: unknown): Promise<TdaiCore> {
     const routing = resolveUserIdRouting(
       {
         multiUserEnabled: this.config.multiUser.enabled,
@@ -197,13 +204,20 @@ export class TdaiGateway {
     }
 
     if (routing.pool === "user" && routing.uid) {
-      return this.getCoreForUser(routing.uid);
+      const entry = this.getCoreForUser(routing.uid);
+      // Concurrent first requests share one initialization (promise dedup).
+      await entry.ready.catch(() => {});
+      return entry.core;
     }
+    // The main core is initialized in start() before the HTTP server accepts
+    // requests, so it needs no readiness await here.
     return this.core;
   }
 
   /**
-   * Get (lazily creating) the per-user core for a normalized uid.
+   * Get (lazily creating) the per-user core entry for a normalized uid.
+   * Returns the entry (core + shared `initialize()` promise) rather than the
+   * bare core so callers can await readiness — see {@link _resolveCore}.
    *
    * Each user gets its own `StandaloneHostAdapter` + `TdaiCore` rooted at
    * `<baseDir>/users/<uid>/` — `initStores` caches per dataDir, so a distinct
@@ -211,11 +225,11 @@ export class TdaiGateway {
    * persona, scene blocks, checkpoints). Concurrent first requests for the
    * same uid share one initialization via the Map entry (promise dedup).
    */
-  private getCoreForUser(uid: string): TdaiCore {
+  private getCoreForUser(uid: string): UserCoreEntry {
     const existing = this.userCores.get(uid);
     if (existing) {
       existing.lastAccess = Date.now();
-      return existing.core;
+      return existing;
     }
 
     // uid is validated (`^[a-z0-9_-]{1,64}$`), so this path cannot traverse.
@@ -244,7 +258,7 @@ export class TdaiGateway {
     });
 
     this.evictUserCoresIfNeeded();
-    return core;
+    return entry;
   }
 
   /**
@@ -549,7 +563,7 @@ export class TdaiGateway {
     }
 
     const startMs = Date.now();
-    const core = this._resolveCore(body.user_id);
+    const core = await this._resolveCore(body.user_id);
     const result = await core.handleBeforeRecall(body.query, body.session_key);
     const elapsed = Date.now() - startMs;
 
@@ -572,7 +586,7 @@ export class TdaiGateway {
     }
 
     const startMs = Date.now();
-    const core = this._resolveCore(body.user_id);
+    const core = await this._resolveCore(body.user_id);
     const result = await core.handleTurnCommitted({
       userText: body.user_content,
       assistantText: body.assistant_content,
@@ -602,7 +616,7 @@ export class TdaiGateway {
       return;
     }
 
-    const core = this._resolveCore(body.user_id);
+    const core = await this._resolveCore(body.user_id);
     const result = await core.searchMemories({
       query: body.query,
       limit: body.limit,
@@ -626,7 +640,7 @@ export class TdaiGateway {
       return;
     }
 
-    const core = this._resolveCore(body.user_id);
+    const core = await this._resolveCore(body.user_id);
     const result = await core.searchConversations({
       query: body.query,
       limit: body.limit,
@@ -648,7 +662,7 @@ export class TdaiGateway {
       return;
     }
 
-    const core = this._resolveCore(body.user_id);
+    const core = await this._resolveCore(body.user_id);
     await core.handleSessionEnd(body.session_key);
 
     const response: SessionEndResponse = { flushed: true };
