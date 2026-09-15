@@ -578,7 +578,10 @@ memory-tencentdb-ctl health
   - `.metadata/recall_checkpoint.json` - Pipeline state
   - `.backup/` - Backup archives
 
-- **Gateway Logs**: `$TDAI_DATA_DIR/logs/gateway.{stdout,stderr}.log`
+- **Gateway Logs** (path depends on who spawned the gateway):
+  - `start-gateway.sh` (manual deployment): `~/.memory-tencentdb/logs/gateway.out.log` + `gateway.err.log` (stderr lines timestamped by the script)
+  - Hermes supervisor-spawned (Mode A): `~/.hermes/logs/memory_tencentdb/gateway.{stdout,stderr}.log`
+  - `memory-tencentdb-ctl.sh` standalone mode: `$TDAI_DATA_DIR/logs/gateway.{stdout,stderr}.log`
 - **OpenClaw Logs**: `~/.openclaw/logs/memory-tdai.log`
 
 ### Health Checks
