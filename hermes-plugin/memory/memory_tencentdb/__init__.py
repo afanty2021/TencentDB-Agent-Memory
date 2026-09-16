@@ -146,7 +146,9 @@ def _resolve_gateway_api_key() -> Optional[str]:
     environment. That helper reads the dotenv file and the 1Password secret
     scope (secret_scope itself may fall back to ``os.environ`` when no
     multiplex scope is active), making it a complement to the loop above
-    rather than a duplicate.
+    rather than a duplicate. A helper failure on one variable is logged and
+    skipped — this resolver never raises, so it cannot break provider
+    registration where ``is_available`` must never throw.
 
     Rotation caveat: the environment loop wins whenever a value is present,
     so a long-lived process keeps using the key it loaded at startup even
@@ -177,7 +179,17 @@ def _resolve_gateway_api_key() -> Optional[str]:
         logger.debug("agent.credential_pool unavailable; no dotenv fallback")
         return None
     for var in ("MEMORY_TENCENTDB_GATEWAY_API_KEY", "TDAI_GATEWAY_API_KEY"):
-        value = get_env_prefer_dotenv(var).strip()
+        try:
+            value = get_env_prefer_dotenv(var).strip()
+        except Exception:
+            # Per-variable isolation: a misbehaving helper degrades to the
+            # next variable instead of escaping into provider registration.
+            # warning (not debug) keeps the failure visible for attribution
+            # when the client later sends no/failed Bearer auth.
+            logger.warning(
+                "dotenv fallback lookup failed for %s", var, exc_info=True
+            )
+            continue
         if value:
             return value
     return None

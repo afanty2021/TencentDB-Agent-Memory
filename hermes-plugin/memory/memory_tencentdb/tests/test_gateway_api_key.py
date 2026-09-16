@@ -15,6 +15,11 @@ review round 2026-09-16):
      (legacy env-only behaviour preserved).
   5. **无钥** — nothing anywhere → ``None`` → the client attaches no
      ``Authorization`` header (open-gateway compatibility).
+  6. **逐变量隔离** — a non-ImportError helper failure on the first
+     variable neither escapes nor abandons the second variable
+     (``is_available`` must never throw during provider registration).
+  7. **日志无钥** — no code path writes key material into logs
+     (env win, dotenv success, helper failure, ImportError degradation).
 
 Whitespace-only env values count as unset (defensive strip). The client
 header assertions pin the end effect: ``None`` key ⇒ no ``Authorization``.
@@ -91,6 +96,57 @@ def test_degrades_when_credential_pool_missing(monkeypatch):
 def test_no_key_anywhere_returns_none(monkeypatch):
     _install_fake_dotenv(monkeypatch, values={})
     assert _resolve_gateway_api_key() is None
+
+
+def test_helper_exception_isolated_per_var(monkeypatch):
+    """A non-ImportError helper failure on the first variable must neither
+    escape nor abandon the second variable (never-throw registration
+    contract of ``is_available``)."""
+    calls = []
+
+    def flaky(key: str) -> str:
+        calls.append(key)
+        if key == "MEMORY_TENCENTDB_GATEWAY_API_KEY":
+            raise RuntimeError("simulated helper misbehaviour")
+        return "dotenv-key"
+
+    module = types.ModuleType("agent.credential_pool")
+    module.get_env_prefer_dotenv = flaky
+    monkeypatch.setitem(sys.modules, "agent.credential_pool", module)
+
+    assert _resolve_gateway_api_key() == "dotenv-key"
+    assert calls == ["MEMORY_TENCENTDB_GATEWAY_API_KEY", "TDAI_GATEWAY_API_KEY"]
+
+
+def test_no_key_material_in_logs(monkeypatch, caplog):
+    """Pin the no-leak contract across all four resolution paths."""
+    import logging
+
+    secret = "super-secret-key-material"
+    with caplog.at_level(
+        logging.DEBUG, logger="plugins.memory.memory_tencentdb"
+    ):
+        # 1) env win
+        monkeypatch.setenv("TDAI_GATEWAY_API_KEY", secret)
+        assert _resolve_gateway_api_key() == secret
+        # 2) dotenv success
+        monkeypatch.delenv("TDAI_GATEWAY_API_KEY")
+        _install_fake_dotenv(monkeypatch, values={"TDAI_GATEWAY_API_KEY": secret})
+        assert _resolve_gateway_api_key() == secret
+        # 3) helper failure → warning path, degraded to None
+        module = types.ModuleType("agent.credential_pool")
+
+        def boom(key: str) -> str:
+            raise RuntimeError("boom")
+
+        module.get_env_prefer_dotenv = boom
+        monkeypatch.setitem(sys.modules, "agent.credential_pool", module)
+        assert _resolve_gateway_api_key() is None
+        # 4) ImportError degradation → debug path
+        monkeypatch.setitem(sys.modules, "agent.credential_pool", None)
+        assert _resolve_gateway_api_key() is None
+
+    assert secret not in caplog.text
 
 
 def test_client_omits_authorization_without_key():
