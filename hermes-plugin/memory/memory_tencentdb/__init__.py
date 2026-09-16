@@ -146,9 +146,12 @@ def _resolve_gateway_api_key() -> Optional[str]:
     environment. That helper reads the dotenv file and the 1Password secret
     scope (secret_scope itself may fall back to ``os.environ`` when no
     multiplex scope is active), making it a complement to the loop above
-    rather than a duplicate. A helper failure on one variable is logged and
-    skipped — this resolver never raises, so it cannot break provider
-    registration where ``is_available`` must never throw.
+    rather than a duplicate. A helper failure on one variable is logged
+    (exception class name and variable name only — never the message or
+    traceback, which could embed credential material) and skipped; the
+    credential-pool import is contained the same way. This resolver never
+    raises, so it cannot break provider registration where ``is_available``
+    must never throw.
 
     Rotation caveat: the environment loop wins whenever a value is present,
     so a long-lived process keeps using the key it loaded at startup even
@@ -173,21 +176,31 @@ def _resolve_gateway_api_key() -> Optional[str]:
             return value
     try:
         from agent.credential_pool import get_env_prefer_dotenv
-    except ImportError:
-        # Stub/partial checkouts don't ship the credential pool — dotenv
-        # fallback silently unavailable, legacy env-only behaviour applies.
-        logger.debug("agent.credential_pool unavailable; no dotenv fallback")
+    except Exception as exc:
+        # Stub/partial checkouts don't ship the credential pool (ImportError)
+        # and a broken checkout can fail with anything else — either way the
+        # dotenv fallback is silently unavailable and legacy env-only
+        # behaviour applies. Class name only: never the message/traceback.
+        logger.debug(
+            "credential pool import failed (%s); no dotenv fallback",
+            type(exc).__name__,
+        )
         return None
     for var in ("MEMORY_TENCENTDB_GATEWAY_API_KEY", "TDAI_GATEWAY_API_KEY"):
         try:
             value = get_env_prefer_dotenv(var).strip()
-        except Exception:
+        except Exception as exc:
             # Per-variable isolation: a misbehaving helper degrades to the
             # next variable instead of escaping into provider registration.
-            # warning (not debug) keeps the failure visible for attribution
-            # when the client later sends no/failed Bearer auth.
+            # Only the exception class name and the variable name are logged
+            # — never the message or traceback, because helper exception
+            # text is operator-adjacent data and may embed credential
+            # material. warning (not debug) keeps the failure visible for
+            # attribution when the client later sends no/failed Bearer auth.
             logger.warning(
-                "dotenv fallback lookup failed for %s", var, exc_info=True
+                "dotenv fallback lookup failed for %s (%s)",
+                var,
+                type(exc).__name__,
             )
             continue
         if value:

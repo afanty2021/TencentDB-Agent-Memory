@@ -149,6 +149,33 @@ def test_no_key_material_in_logs(monkeypatch, caplog):
     assert secret not in caplog.text
 
 
+def test_helper_exception_message_not_logged(monkeypatch, caplog):
+    """The exception MESSAGE itself is the most dangerous leak channel:
+    ``exc_info=True`` writes the full traceback (including the message) into
+    the log. The resolver must log only the exception class name and the
+    variable name — helper exception text is operator-adjacent data and may
+    embed credential material (e.g. a helper that interpolates the value it
+    failed to read)."""
+    import logging
+
+    secret = "super-secret-key-material"
+    module = types.ModuleType("agent.credential_pool")
+
+    def leaky(key: str) -> str:
+        raise RuntimeError(f"helper failed to read {key}: {secret}")
+
+    module.get_env_prefer_dotenv = leaky
+    monkeypatch.setitem(sys.modules, "agent.credential_pool", module)
+
+    with caplog.at_level(
+        logging.DEBUG, logger="plugins.memory.memory_tencentdb"
+    ):
+        assert _resolve_gateway_api_key() is None
+
+    assert secret not in caplog.text
+    assert "leaky" not in caplog.text  # function name must not leak either
+
+
 def test_client_omits_authorization_without_key():
     client = MemoryTencentdbSdkClient(api_key=None)
     assert "Authorization" not in client._build_headers(content_type=False)
