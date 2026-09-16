@@ -128,7 +128,7 @@ def _resolve_gateway_host(default: str = _DEFAULT_GATEWAY_HOST) -> str:
 
 
 def _resolve_gateway_api_key() -> Optional[str]:
-    """Read the optional Gateway Bearer token from the environment.
+    """Read the optional Gateway Bearer token from the environment or ~/.hermes/.env.
 
     Looks at ``MEMORY_TENCENTDB_GATEWAY_API_KEY`` (Hermes-namespaced) first;
     falls back to ``TDAI_GATEWAY_API_KEY`` so an operator who already wired
@@ -137,6 +137,12 @@ def _resolve_gateway_api_key() -> Optional[str]:
     Authorization header" — exactly matching the Gateway's own legacy
     default. Whitespace-only values are treated as unset to guard against
     shells that quote ``\\n`` into env vars.
+
+    Service processes (launchd, systemd) never inherit shell exports, so the
+    operator's ``~/.hermes/.env`` — the canonical Hermes secret store — is
+    consulted as a fallback via ``get_env_prefer_dotenv``. That helper reads
+    the dotenv file and the 1Password secret scope only (never os.environ),
+    which makes it a complement to the loop above rather than a duplicate.
 
     Important: this is purely the **client-side** secret. Whether the
     Gateway actually enforces a Bearer check is decided on the Gateway
@@ -152,6 +158,15 @@ def _resolve_gateway_api_key() -> Optional[str]:
         value = raw.strip()
         if value:
             return value
+    try:
+        from agent.credential_pool import get_env_prefer_dotenv
+
+        for var in ("MEMORY_TENCENTDB_GATEWAY_API_KEY", "TDAI_GATEWAY_API_KEY"):
+            value = get_env_prefer_dotenv(var).strip()
+            if value:
+                return value
+    except Exception:
+        logger.debug("dotenv fallback for Gateway api key unavailable", exc_info=True)
     return None
 
 
