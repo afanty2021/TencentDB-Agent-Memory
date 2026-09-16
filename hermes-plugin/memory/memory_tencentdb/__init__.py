@@ -128,7 +128,8 @@ def _resolve_gateway_host(default: str = _DEFAULT_GATEWAY_HOST) -> str:
 
 
 def _resolve_gateway_api_key() -> Optional[str]:
-    """Read the optional Gateway Bearer token from the environment or ~/.hermes/.env.
+    """Read the optional Gateway Bearer token from the environment or the
+    Hermes ``.env`` (profile-aware ``<hermes_home>/.env``).
 
     Looks at ``MEMORY_TENCENTDB_GATEWAY_API_KEY`` (Hermes-namespaced) first;
     falls back to ``TDAI_GATEWAY_API_KEY`` so an operator who already wired
@@ -139,10 +140,20 @@ def _resolve_gateway_api_key() -> Optional[str]:
     shells that quote ``\\n`` into env vars.
 
     Service processes (launchd, systemd) never inherit shell exports, so the
-    operator's ``~/.hermes/.env`` — the canonical Hermes secret store — is
-    consulted as a fallback via ``get_env_prefer_dotenv``. That helper reads
-    the dotenv file and the 1Password secret scope only (never os.environ),
-    which makes it a complement to the loop above rather than a duplicate.
+    operator's ``.env`` — the canonical Hermes secret store, resolved
+    profile-aware via ``get_env_prefer_dotenv`` (``<hermes_home>/.env``) — is
+    consulted as a fallback once neither variable is present in the process
+    environment. That helper reads the dotenv file and the 1Password secret
+    scope (secret_scope itself may fall back to ``os.environ`` when no
+    multiplex scope is active), making it a complement to the loop above
+    rather than a duplicate.
+
+    Rotation caveat: the environment loop wins whenever a value is present,
+    so a long-lived process keeps using the key it loaded at startup even
+    after every ``.env`` copy has been updated — the dotenv fallback only
+    covers processes that never had the key. Rotating the key therefore
+    means updating all ``.env`` copies AND restarting the gateway (or
+    otherwise reloading the process environment).
 
     Important: this is purely the **client-side** secret. Whether the
     Gateway actually enforces a Bearer check is decided on the Gateway
