@@ -171,13 +171,15 @@ def _resolve_gateway_api_key() -> Optional[str]:
             return value
     try:
         from agent.credential_pool import get_env_prefer_dotenv
-
-        for var in ("MEMORY_TENCENTDB_GATEWAY_API_KEY", "TDAI_GATEWAY_API_KEY"):
-            value = get_env_prefer_dotenv(var).strip()
-            if value:
-                return value
-    except Exception:
-        logger.debug("dotenv fallback for Gateway api key unavailable", exc_info=True)
+    except ImportError:
+        # Stub/partial checkouts don't ship the credential pool — dotenv
+        # fallback silently unavailable, legacy env-only behaviour applies.
+        logger.debug("agent.credential_pool unavailable; no dotenv fallback")
+        return None
+    for var in ("MEMORY_TENCENTDB_GATEWAY_API_KEY", "TDAI_GATEWAY_API_KEY"):
+        value = get_env_prefer_dotenv(var).strip()
+        if value:
+            return value
     return None
 
 
@@ -815,6 +817,11 @@ class MemoryTencentdbProvider(MemoryProvider):
             Gateway is ready.
         """
         self._session_id = session_id
+        # Host-injected kwargs like ``hermes_home`` are deliberately ignored:
+        # the gateway CLI exports HERMES_HOME as a process-level env long
+        # before this runs, so home-scoped resolution (dotenv fallback above,
+        # gateway discovery below) already targets the right profile home.
+        # Consuming the kwarg here would create a second source of truth.
         # Static session-owner fallback. Deliberately NOT normalized here:
         # the Gateway is the normalization authority — it lowercases,
         # ASCII-trims and fail-closes this value at routing time, so a
