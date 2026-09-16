@@ -20,6 +20,14 @@ review round 2026-09-16):
      (``is_available`` must never throw during provider registration).
   7. **日志无钥** — no code path writes key material into logs
      (env win, dotenv success, helper failure, ImportError degradation).
+     The helper-failure test also pins the sanitized attribution line
+     (variable + class name) *positively* — deleting the warning itself
+     turns the suite red, so 401 attribution is protected too.
+  8. **import 期异常** — a credential_pool that explodes at import time
+     with a non-ImportError (module-level raise in a broken checkout) is
+     contained by the widened import guard: debug with the class name
+     only, resolver returns ``None``. The never-raise contract has no
+     ImportError-shaped hole.
 
 Whitespace-only env values count as unset (defensive strip). The client
 header assertions pin the end effect: ``None`` key ⇒ no ``Authorization``.
@@ -174,6 +182,40 @@ def test_helper_exception_message_not_logged(monkeypatch, caplog):
 
     assert secret not in caplog.text
     assert "leaky" not in caplog.text  # function name must not leak either
+    assert "helper failed to read" not in caplog.text  # message text excluded
+    # Positive pin: the sanitized attribution line (variable + class name)
+    # must survive — removing the warning itself turns this test red, so
+    # the no-leak contract cannot be "passed" by silently dropping the
+    # 401-attribution log.
+    assert (
+        "dotenv fallback lookup failed for MEMORY_TENCENTDB_GATEWAY_API_KEY"
+        " (RuntimeError)" in caplog.text
+    )
+
+
+def test_import_explosion_non_importerror_degrades(monkeypatch, caplog):
+    """The widened import guard (``except Exception``, not just
+    ``except ImportError``) must contain a credential_pool that explodes at
+    import time with a non-ImportError — e.g. a module-level raise in a
+    broken checkout, which is not an ImportError subclass. The resolver
+    degrades to ``None`` and the debug line carries the class name only."""
+    import logging
+
+    class ExplodingPool(types.ModuleType):
+        def __getattr__(self, name):
+            raise RuntimeError("credential_pool exploded at import")
+
+    monkeypatch.setitem(
+        sys.modules, "agent.credential_pool", ExplodingPool("agent.credential_pool")
+    )
+
+    with caplog.at_level(
+        logging.DEBUG, logger="plugins.memory.memory_tencentdb"
+    ):
+        assert _resolve_gateway_api_key() is None
+
+    assert "credential pool import failed (RuntimeError)" in caplog.text
+    assert "exploded" not in caplog.text  # message excluded, class name only
 
 
 def test_client_omits_authorization_without_key():
