@@ -579,7 +579,7 @@ memory-tencentdb-ctl health
   - `.backup/` - Backup archives
 
 - **Gateway Logs** (path depends on who spawned the gateway):
-  - `start-gateway.sh` (manual deployment): `~/.memory-tencentdb/logs/gateway.out.log` + `gateway.err.log` (stderr lines timestamped by the script)
+  - `start-gateway.sh` (manual deployment, operator-side — not in this repo): `~/.memory-tencentdb/logs/gateway.out.log` + `gateway.err.log` (stderr lines timestamped by the script)
   - Hermes supervisor-spawned (Mode A): `~/.hermes/logs/memory_tencentdb/gateway.{stdout,stderr}.log`
   - `memory-tencentdb-ctl.sh` standalone mode: `$TDAI_DATA_DIR/logs/gateway.{stdout,stderr}.log`
 - **OpenClaw Logs**: `~/.openclaw/logs/memory-tdai.log`
