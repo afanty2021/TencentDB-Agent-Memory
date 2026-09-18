@@ -33,7 +33,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from agent.memory_provider import MemoryProvider
 
@@ -138,8 +138,10 @@ _GATEWAY_API_KEY_VARS = ("MEMORY_TENCENTDB_GATEWAY_API_KEY", "TDAI_GATEWAY_API_K
 # inside is_available()/initialize().
 _DOTENV_HELPER_TIMEOUT_S = 3.0
 
+_DotenvLookupOutcome = Literal["ok", "error", "timeout"]
 
-def _dotenv_lookup_bounded(get_env_prefer_dotenv, var: str) -> tuple:
+
+def _dotenv_lookup_bounded(get_env_prefer_dotenv, var: str) -> tuple[_DotenvLookupOutcome, Any]:
     """Run one credential-pool lookup under a hard timeout.
 
     Returns ``("ok", value)``, ``("error", exception)`` or ``("timeout", None)``.
@@ -150,9 +152,14 @@ def _dotenv_lookup_bounded(get_env_prefer_dotenv, var: str) -> tuple:
     outcome: Dict[str, Any] = {}
 
     def _run() -> None:
+        # BaseException, not Exception: in an isolated daemon worker even a
+        # SystemExit/KeyboardInterrupt must land in the outcome dict instead
+        # of escaping to threading.excepthook and spraying a stderr
+        # traceback. The caller logs the class name only, so this stays
+        # inside the no-credential-material-in-logs contract.
         try:
             outcome["value"] = get_env_prefer_dotenv(var).strip()
-        except Exception as exc:  # isolated on purpose — caller logs class only
+        except BaseException as exc:  # noqa: BLE001 — isolated on purpose
             outcome["error"] = exc
 
     worker = threading.Thread(target=_run, daemon=True)
@@ -242,7 +249,7 @@ def _resolve_gateway_api_key() -> Optional[str]:
             continue
         if outcome == "timeout":
             logger.warning(
-                "dotenv fallback lookup timed out for %s (>%.0fs); skipping dotenv fallback",
+                "dotenv fallback lookup timed out for %s (>%.0fs); skipping this variable",
                 var,
                 _DOTENV_HELPER_TIMEOUT_S,
             )

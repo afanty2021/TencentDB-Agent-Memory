@@ -28,6 +28,11 @@ review round 2026-09-16):
      contained by the widened import guard: debug with the class name
      only, resolver returns ``None``. The never-raise contract has no
      ImportError-shaped hole.
+  9. **超时界** — a hung credential-pool helper (e.g. a locked secret
+     vault) degrades after ``_DOTENV_HELPER_TIMEOUT_S`` instead of
+     stalling provider registration: the late value is never adopted,
+     the sanitized timeout warning names the variable, and the loop
+     continues to the next variable.
 
 Whitespace-only env values count as unset (defensive strip). The client
 header assertions pin the end effect: ``None`` key ⇒ no ``Authorization``.
@@ -52,8 +57,11 @@ def _clean_env(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
-def _install_fake_dotenv(monkeypatch, values=None, forbidden=False):
+def _install_fake_dotenv(monkeypatch, values=None, forbidden=False, getenv=None):
     """Pin a fake ``agent.credential_pool`` for the duration of a test.
+
+    ``getenv`` supplies a fully custom lookup function (used by the timeout
+    tests to simulate a hung credential-pool helper).
 
     With ``forbidden=True`` the fake raises AssertionError on any lookup.
     The resolver swallows that via ``except Exception``, so the assertion
@@ -65,6 +73,8 @@ def _install_fake_dotenv(monkeypatch, values=None, forbidden=False):
     if forbidden:
         def get_env_prefer_dotenv(key: str) -> str:
             raise AssertionError("dotenv consulted while an env key is present")
+    elif getenv is not None:
+        get_env_prefer_dotenv = getenv
     else:
         def get_env_prefer_dotenv(key: str) -> str:
             return (values or {}).get(key, "")
@@ -235,3 +245,68 @@ def test_client_sends_bearer_with_key():
     client = MemoryTencentdbSdkClient(api_key="secret")
     headers = client._build_headers(content_type=False)
     assert headers["Authorization"] == "Bearer secret"
+
+
+def test_dotenv_lookup_timeout_degrades(monkeypatch, caplog, _clean_env):
+    """契约 9 — 挂死的 credential-pool 助手在超时后降级。
+
+    整个有界查找的实质就在这条路径上：若有人把 join(timeout) 改回
+    join()、或调换 is_alive/error 的检查顺序，此测试必须变红——否则
+    注册会被锁死的 secret scope 无界拖住，且迟到值会被静默采用。
+    """
+    import logging
+    import time as time_mod
+
+    import plugins.memory.memory_tencentdb as provider
+
+    monkeypatch.setattr(provider, "_DOTENV_HELPER_TIMEOUT_S", 0.05)
+
+    def hung_helper(key: str) -> str:
+        time_mod.sleep(0.5)
+        return "late-key-that-must-not-be-used"
+
+    _install_fake_dotenv(monkeypatch, getenv=hung_helper)
+
+    with caplog.at_level(logging.WARNING):
+        assert _resolve_gateway_api_key() is None
+
+    timeout_lines = [r for r in caplog.records if "timed out" in r.getMessage()]
+    assert len(timeout_lines) == 2  # both variables hit the ceiling
+    assert all(
+        "TDAI_GATEWAY_API_KEY" in r.getMessage()
+        or "MEMORY_TENCENTDB_GATEWAY_API_KEY" in r.getMessage()
+        for r in timeout_lines
+    )
+    assert all("late-key" not in r.getMessage() for r in caplog.records)
+
+
+def test_dotenv_timeout_continues_to_next_var(monkeypatch, caplog, _clean_env):
+    """契约 9b — 超时只跳过当前变量，continue 到下一个变量。
+
+    钉死 ("timeout", None) 分支的 continue 语义：第一个变量挂死时，
+    第二个变量的正常返回值仍被采用；第一个变量迟到的值不得出现。
+    """
+    import logging
+    import time as time_mod
+
+    import plugins.memory.memory_tencentdb as provider
+
+    monkeypatch.setattr(provider, "_DOTENV_HELPER_TIMEOUT_S", 0.05)
+
+    def selective_helper(key: str) -> str:
+        if key == "MEMORY_TENCENTDB_GATEWAY_API_KEY":
+            time_mod.sleep(0.5)  # hangs past the ceiling
+            return "late-namespaced-key"
+        return "dotenv-key"
+
+    _install_fake_dotenv(monkeypatch, getenv=selective_helper)
+
+    with caplog.at_level(logging.WARNING):
+        assert _resolve_gateway_api_key() == "dotenv-key"
+
+    assert any(
+        "MEMORY_TENCENTDB_GATEWAY_API_KEY" in r.getMessage()
+        and "timed out" in r.getMessage()
+        for r in caplog.records
+    )
+    assert all("late-namespaced" not in r.getMessage() for r in caplog.records)
