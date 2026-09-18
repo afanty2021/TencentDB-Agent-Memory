@@ -127,6 +127,44 @@ def _resolve_gateway_host(default: str = _DEFAULT_GATEWAY_HOST) -> str:
     return host or default
 
 
+# Client-side gateway API key variable priority: the namespaced alias wins
+# over the legacy name. Shared by the process-env loop and the dotenv
+# fallback loop so the two orders cannot drift apart.
+_GATEWAY_API_KEY_VARS = ("MEMORY_TENCENTDB_GATEWAY_API_KEY", "TDAI_GATEWAY_API_KEY")
+
+# Hard ceiling on one credential-pool helper call. The helper may reach
+# external secret scopes (e.g. a locked 1Password vault); a hung lookup must
+# degrade instead of stalling provider registration, which runs synchronously
+# inside is_available()/initialize().
+_DOTENV_HELPER_TIMEOUT_S = 3.0
+
+
+def _dotenv_lookup_bounded(get_env_prefer_dotenv, var: str) -> tuple:
+    """Run one credential-pool lookup under a hard timeout.
+
+    Returns ``("ok", value)``, ``("error", exception)`` or ``("timeout", None)``.
+    The worker is a daemon thread: on timeout it is abandoned (the underlying
+    call, if it ever completes, writes into a dict nobody reads) and the
+    resolver degrades instead of blocking registration.
+    """
+    outcome: Dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            outcome["value"] = get_env_prefer_dotenv(var).strip()
+        except Exception as exc:  # isolated on purpose — caller logs class only
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(_DOTENV_HELPER_TIMEOUT_S)
+    if worker.is_alive():
+        return "timeout", None
+    if "error" in outcome:
+        return "error", outcome["error"]
+    return "ok", outcome.get("value", "")
+
+
 def _resolve_gateway_api_key() -> Optional[str]:
     """Read the optional Gateway Bearer token from the environment or the
     Hermes ``.env`` (profile-aware ``<hermes_home>/.env``).
@@ -167,7 +205,7 @@ def _resolve_gateway_api_key() -> Optional[str]:
     The operator must configure the same secret on both ends if they
     want auth enforcement.
     """
-    for var in ("MEMORY_TENCENTDB_GATEWAY_API_KEY", "TDAI_GATEWAY_API_KEY"):
+    for var in _GATEWAY_API_KEY_VARS:
         raw = os.environ.get(var)
         if raw is None:
             continue
@@ -186,10 +224,9 @@ def _resolve_gateway_api_key() -> Optional[str]:
             type(exc).__name__,
         )
         return None
-    for var in ("MEMORY_TENCENTDB_GATEWAY_API_KEY", "TDAI_GATEWAY_API_KEY"):
-        try:
-            value = get_env_prefer_dotenv(var).strip()
-        except Exception as exc:
+    for var in _GATEWAY_API_KEY_VARS:
+        outcome, payload = _dotenv_lookup_bounded(get_env_prefer_dotenv, var)
+        if outcome == "error":
             # Per-variable isolation: a misbehaving helper degrades to the
             # next variable instead of escaping into provider registration.
             # Only the exception class name and the variable name are logged
@@ -200,11 +237,18 @@ def _resolve_gateway_api_key() -> Optional[str]:
             logger.warning(
                 "dotenv fallback lookup failed for %s (%s)",
                 var,
-                type(exc).__name__,
+                type(payload).__name__,
             )
             continue
-        if value:
-            return value
+        if outcome == "timeout":
+            logger.warning(
+                "dotenv fallback lookup timed out for %s (>%.0fs); skipping dotenv fallback",
+                var,
+                _DOTENV_HELPER_TIMEOUT_S,
+            )
+            continue
+        if payload:
+            return payload
     return None
 
 

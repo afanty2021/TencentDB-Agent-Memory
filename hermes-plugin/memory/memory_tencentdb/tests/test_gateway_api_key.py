@@ -53,7 +53,15 @@ def _clean_env(monkeypatch):
 
 
 def _install_fake_dotenv(monkeypatch, values=None, forbidden=False):
-    """Pin a fake ``agent.credential_pool`` for the duration of a test."""
+    """Pin a fake ``agent.credential_pool`` for the duration of a test.
+
+    With ``forbidden=True`` the fake raises AssertionError on any lookup.
+    The resolver swallows that via ``except Exception``, so the assertion
+    never surfaces — the falsification actually works through the RETURN
+    value: if the resolver consulted dotenv, it would return the (absent)
+    dotenv value / None instead of the env key, and the ``==`` assertion
+    below fails.
+    """
     if forbidden:
         def get_env_prefer_dotenv(key: str) -> str:
             raise AssertionError("dotenv consulted while an env key is present")
