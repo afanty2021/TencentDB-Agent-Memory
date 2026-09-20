@@ -15,6 +15,9 @@ describe("L1 extraction prompt — attribution guardrails", () => {
     // Forwarded/quoted third-party self-descriptions must never be
     // attributed to the user.
     expect(EXTRACT_MEMORIES_SYSTEM_PROMPT).toContain("一律不得写成\"用户……\"");
+    // Attribution must not suppress extraction: counterpart-subject
+    // episodic memories are the intended outcome for forwarded content.
+    expect(EXTRACT_MEMORIES_SYSTEM_PROMPT).toContain("不得因归属第三方而整体放弃提取");
   });
 
   it("keeps the persona identity red-line", () => {
