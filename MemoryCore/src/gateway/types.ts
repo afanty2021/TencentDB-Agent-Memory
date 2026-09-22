@@ -81,6 +81,8 @@ export interface MemorySearchRequest {
   limit?: number;
   type?: string;
   scene?: string;
+  /** Raw caller-declared user id — routed via multi-user rules when enabled. */
+  user_id?: string;
 }
 
 export interface MemorySearchResponse {
@@ -97,6 +99,8 @@ export interface ConversationSearchRequest {
   query: string;
   limit?: number;
   session_key?: string;
+  /** Raw caller-declared user id — routed via multi-user rules when enabled. */
+  user_id?: string;
 }
 
 export interface ConversationSearchResponse {
@@ -144,6 +148,13 @@ export interface SeedRequest {
   auto_fill_timestamps?: boolean;
   /** Plugin config overrides (deep-merged on top of gateway memory config). */
   config_override?: Record<string, unknown>;
+  /**
+   * Raw caller-declared user id. Seeds always write to the MAIN store; when
+   * multi-user routing is enabled and this id resolves to a regular per-user
+   * store, the request is rejected with HTTP 403 (guards against misuse —
+   * the gateway cannot verify the caller's identity).
+   */
+  user_id?: string;
 }
 
 export interface SeedResponse {

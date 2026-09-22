@@ -538,6 +538,45 @@ export class CheckpointManager {
     this.logger.info(`[checkpoint] incrementScenesProcessed: scenes_processed=${cp.scenes_processed}`);
   }
 
+  // ============================
+  // Recalculate — reconcile counters with actual data
+  // ============================
+
+  /**
+   * Recalculate checkpoint counters from actual data source counts.
+   *
+   * After cleanup operations (memory-cleaner, manual JSONL pruning, or
+   * pipeline state deletion), the checkpoint counters may drift from the
+   * actual number of records in the store. Per-user cores (multi-user
+   * routing) also rely on this after LRU eviction + directory rebuild.
+   *
+   * This method overwrites the specified counters under the file lock.
+   * Counters not provided are left unchanged.
+   *
+   * @param actual  Actual counts from the data store. All fields optional.
+   */
+  async recalculate(actual: {
+    l0Conversations?: number;
+    l1Memories?: number;
+    totalProcessed?: number;
+    scenesProcessed?: number;
+  }): Promise<Checkpoint> {
+    return this.mutate((cp) => {
+      if (actual.l0Conversations !== undefined) {
+        cp.l0_conversations_count = actual.l0Conversations;
+      }
+      if (actual.l1Memories !== undefined) {
+        cp.total_memories_extracted = actual.l1Memories;
+      }
+      if (actual.totalProcessed !== undefined) {
+        cp.total_processed = actual.totalProcessed;
+      }
+      if (actual.scenesProcessed !== undefined) {
+        cp.scenes_processed = actual.scenesProcessed;
+      }
+    });
+  }
+
   /**
    * Increment `memories_since_last_persona` (and `total_memories_extracted`)
    * on this checkpoint by `count`.

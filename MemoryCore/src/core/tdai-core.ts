@@ -668,8 +668,32 @@ export class TdaiCore {
     return this.cfg.llm.provider === "proxy";
   }
 
-  private wirePipelineRunners(): void {
+  private async wirePipelineRunners(): Promise<void> {
     if (!this.scheduler) return;
+
+    // Reconcile checkpoint counters with actual data store records.
+    // After cleanup operations (memory-cleaner, manual JSONL pruning) the
+    // counters may drift; recalculate before the pipeline starts to prevent
+    // incorrect trigger decisions (e.g. persona generation thresholds).
+    // Also covers a per-user core rebuilt after LRU eviction.
+    try {
+      const cpManager = new CheckpointManager(this.dataDir, this.logger);
+      const [l0Count, l1Count] = await Promise.all([
+        this.vectorStore?.countL0(),
+        this.vectorStore?.countL1(),
+      ]);
+      await cpManager.recalculate({
+        l0Conversations: l0Count,
+        l1Memories: l1Count,
+      });
+      this.logger.debug?.(
+        `${TAG} Checkpoint recalculated: l0_conversations=${l0Count ?? "N/A"}, l1_memories=${l1Count ?? "N/A"}`,
+      );
+    } catch (err) {
+      this.logger.warn(
+        `${TAG} Checkpoint recalculate skipped (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
 
     // Determine whether to use standalone LLM runner for extraction.
     // Priority: cfg.llm.enabled (explicit override) > hostType detection.
