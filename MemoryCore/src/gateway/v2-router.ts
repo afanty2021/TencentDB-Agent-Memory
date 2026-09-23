@@ -28,6 +28,7 @@ import { executeMemorySearch } from "../core/tools/memory-search.js";
 import { executeConversationSearch } from "../core/tools/conversation-search.js";
 import type { MemoryRecord } from "../core/record/l1-writer.js";
 import { reportRecallMetrics } from "../core/report/metric-tracking-recall.js";
+import { normalizeUserId } from "../utils/user-id.js";
 
 // ── Zod schemas (validated types + defaults) ──
 import {
@@ -172,6 +173,68 @@ const V3_ALLOWED_SUBPATHS = new Set<string>([
 ]);
 
 /**
+ * multiUser v3 数据面 per-user 路由（docs/v3-user-routing-design.md §4.2）。
+ *
+ * L0/L1 user 维度端点（读 + 按 id 删）：user_id 本身就是 per-user 隔离
+ * 维度，剥离 team 维度后割接前（team_id="default"）与割接后
+ * （team_id={uid}）两代的行对同一用户都可见/可删——读历史不丢、删语义
+ * 与读对称（否则旧行"读得到删不掉"，delete 返回成功却 deleted_count: 0）。
+ * 删除走 store 的按 id / 按 session 路径，filter 非空性不受影响。
+ * 其余（写 + profile 面）走 subsume。
+ */
+const V3_USER_SCOPED_SUBPATHS = new Set<string>([
+  "/conversation/query",
+  "/conversation/search",
+  "/conversation/count",
+  "/conversation/delete",
+  "/atomic/query",
+  "/atomic/search",
+  "/atomic/count",
+  "/atomic/delete",
+]);
+
+/** The plugin client's placeholder team ("default") — treated as absent under multiUser routing. */
+const TEAM_ID_PLACEHOLDER = "default";
+
+/**
+ * Isolation ctx shape as attached to {@link V2RouterDeps.requestIsolation}.
+ * `subsumedTeam` is set by multiUser routing when it rewrote teamId := userId
+ * (consumers use it to skip team-semantics side effects, e.g. chat-memory
+ * asset registration — see handleConversationAdd).
+ */
+export type V3IsolationCtx = { teamId?: string; userId: string; agentId: string; sessionId: string; taskId?: string; subsumedTeam?: boolean };
+
+/**
+ * multiUser.enabled 时的 v3 数据面 ctx 归一（纯函数，dispatch 处调用）。
+ *
+ * 上游 userId 顶替语义（`ctx.teamId || ctx.userId`）在写入/读取两侧的列
+ * 不一致（设计文档 §2.1 四接缝），不能靠省略 team_id 激活；这里把 userId
+ * **并入** teamId（subsume），让下游全程只见 team——解析器/正则/行存/
+ * 同步全部零改动，L2 任务键与 profile 行列天然按人。
+ *
+ * 规则（v3Subpath ∈ V3_ALLOWED_SUBPATHS 时才被调用）：
+ *   1. user_id 归一化（normalizeUserId，与插件侧逐字对齐），非法 → fail-closed
+ *      400（报字段不报值——userId 即将进 team 槽，这里封死 scope/filter 注入）。
+ *   2. L0/L1 user 维度端点（读 + 按 id 删）：剥离 teamId（undefined = 不限 team）。
+ *   3. 写/profile 端点：teamId 缺省或为 placeholder "default" 时 := userId
+ *      并标记 subsumedTeam；真实 team_id 在场则不动（team 语义优先，
+ *      multiUser 模式假设无真实 team）。
+ */
+export function applyMultiUserV3Routing(ctx: V3IsolationCtx, v3Subpath: string): { ok: true; ctx: V3IsolationCtx } | { ok: false; error: string } {
+  const uid = normalizeUserId(ctx.userId);
+  if (uid === null) {
+    return { ok: false, error: "Invalid user_id: must be 1-64 chars of [a-z0-9_-] after trim/lowercase normalization (value not echoed)" };
+  }
+  if (V3_USER_SCOPED_SUBPATHS.has(v3Subpath)) {
+    const { teamId: _dropped, subsumedTeam: _marker, ...rest } = ctx;
+    return { ok: true, ctx: { ...rest, userId: uid } };
+  }
+  const subsumed = !ctx.teamId || ctx.teamId === TEAM_ID_PLACEHOLDER;
+  const teamId = subsumed ? uid : ctx.teamId;
+  return { ok: true, ctx: { ...ctx, teamId, userId: uid, ...(subsumed ? { subsumedTeam: true } : {}) } };
+}
+
+/**
  * 写一条审计事件到 store.appendAudit。失败不阻塞主请求（容忍 audit 丢失）。
  *
  * 调用约定（per user 决策）：
@@ -305,8 +368,14 @@ export interface V2RouterDeps {
    * `/v3/skill/*` is always exempt.
    */
   v3StrictIsolation?: boolean;
+  /**
+   * `multiUser.enabled` — activates v3 data-plane per-user routing in
+   * dispatchV2Request (user_id normalization + team-slot subsume; see
+   * docs/v3-user-routing-design.md §4.2). Undefined = off.
+   */
+  multiUserEnabled?: boolean;
   /** Resolved isolation context for the current request (set by dispatch). */
-  requestIsolation?: { teamId?: string; userId: string; agentId: string; sessionId: string; taskId?: string };
+  requestIsolation?: V3IsolationCtx;
   /** When isolation could not be resolved AND legacy_compat_mode is off, the missing fields. */
   requestIsolationMissing?: string[];
 }
@@ -616,13 +685,29 @@ export async function handleV2Route(
       }
     }
 
+    // multiUser v3 数据面 per-user 路由（docs/v3-user-routing-design.md §4.2）：
+    // user_id 归一化（fail-closed 400）+ 写/profile 端点 subsume（teamId := userId）
+    // + L0/L1 读端点剥离 team。引擎 dispatch 以下零改动。
+    let isoCtx = isoResolved.ctx;
+    if (deps.multiUserEnabled && isV3 && !isV3Extra) {
+      const muSubpath = pathname.slice(V3_PREFIX.length);
+      if (V3_ALLOWED_SUBPATHS.has(muSubpath)) {
+        const routed = applyMultiUserV3Routing(isoCtx, muSubpath);
+        if (!routed.ok) {
+          sendJson(res, 400, errorEnvelope(400, routed.error, requestId));
+          return true;
+        }
+        isoCtx = routed.ctx;
+      }
+    }
+
     const depsWithIsolation: V2RouterDeps = {
       ...resolvedDeps,
       // /v3 路径强制覆盖 isolationConfig.enforce，确保 handler 内部一致地走严格分支
       isolationConfig: isV3
         ? { enforce: true, legacyCompatMode: false, legacyPlaceholder: resolvedDeps.isolationConfig?.legacyPlaceholder ?? "" }
         : resolvedDeps.isolationConfig,
-      requestIsolation: isoResolved.ctx,
+      requestIsolation: isoCtx,
       // resolveIsolation always returns { ok: true } — missing fields are filled with defaults.
       // requestIsolationMissing is only set when the caller explicitly needs to reject incomplete
       // isolation (e.g. /v3 strict mode), which is handled separately above via collectV3Missing.
@@ -695,7 +780,12 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
   // 会 create asset + append 绑定；后续同 (team, agent) 走进程内 LRU 短路。
   // 失败降级：只打 warn，不阻塞 conversation 写入 —— 记忆数据的可用性优先
   // 于资产登记的一致性（asset 登记失败时下次调用会自动重试）。
-  if (deps.getMetadataService && iso?.teamId && iso?.agentId) {
+  //
+  // multiUser subsume 下跳过：team 槽位是 userId 冒名的，ensureChatMemoryAsset
+  // 会对每个 user 抛 team_mismatch（agent "default" 不属于 team {uid}，且失败
+  // 不进 LRU 缓存）→ 每次写都做一次注定失败的 metadata 往返 + warn。per-user
+  // 资产/clear 链路是 P1（设计文档 §4.2(c)）。
+  if (deps.getMetadataService && iso?.teamId && iso?.agentId && !iso?.subsumedTeam) {
     try {
       const metaSvc = await deps.getMetadataService(auth.serviceId);
       await metaSvc.ensureChatMemoryAsset({

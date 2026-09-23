@@ -1211,6 +1211,9 @@ export class TdaiGateway {
         // `V3_STRICT_ISOLATION` controls only /v3 L0–L3 memory data-plane
         // strictness. Default OFF for local/integration; production should set it.
         v3StrictIsolation: resolveV3StrictIsolation(),
+        // multiUser.enabled → v3 数据面 per-user 路由（user_id 归一化 +
+        // team 槽 subsume），见 docs/v3-user-routing-design.md §4.2。
+        multiUserEnabled: this.config.multiUser.enabled,
         // handleConversationAdd 用它自动登记 chat_memory 资产（team+agent 粒度）
         // 并绑定到 agent。首次写入触发 create + bind；后续同 (team, agent) 走
         // MetadataService 的进程内 LRU 短路。
