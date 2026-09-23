@@ -50,10 +50,12 @@ re-applied by hand and re-verified by tests.
 
 ## Out of scope for this branch (follow-ups)
 
-- **v3-surface user routing**: chat-memory / knowledge / metadata endpoints
-  resolve instances via `ensureMetadataService(instanceId)` and scope content
-  by `(teamId, agentId)`. Routing those by end-user is a design task, not a
-  port — needs a decision on where `user_id` joins the v3 instance model.
+- **v3-surface user routing**: DESIGNED — see `docs/v3-user-routing-design.md`.
+  Analysis found the plugin's constant `team_id="default"` collapses all
+  users' L2/L3 into one shared persona scope today (upstream profiles ignore
+  userId when teamId is present); the recommended fix is a per-user profile
+  scope mode gated by `multiUser.enabled`. Implementation is the P1-P2
+  follow-up, not part of this port.
 - **Per-user cores in `deployMode: service`**: per-user dataDir isolation is
   proven for standalone sqlite; service mode stores via TCVDB/COS instance
   pools and needs its own isolation design.
