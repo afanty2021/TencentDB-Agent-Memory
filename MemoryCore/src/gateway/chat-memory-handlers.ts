@@ -44,7 +44,7 @@ import { createScopedStorageAdapter, scopeProfileStorageView, type StorageAdapte
 import { buildProfileIsolationScope } from "../core/profile/profile-scope.js";
 import { MetadataError, type MetadataService } from "../metadata/service/metadata-service.js";
 import { buildChatMemoryAssetId } from "../metadata/utils/chat-memory-asset.js";
-import { normalizeUserId } from "../utils/user-id.js";
+import { INVALID_USER_ID_MESSAGE, normalizeUserId } from "../utils/user-id.js";
 import type { Logger } from "../core/types.js";
 
 const TAG = "[chat-memory-handlers]";
@@ -547,11 +547,7 @@ async function handleChatMemoryClear(
     for (const candidate of parsedUsers.data.user_ids) {
       const uid = normalizeUserId(candidate);
       if (uid === null) {
-        return errorEnvelope(
-          400,
-          "Invalid user_id: must be 1-64 chars of [a-z0-9_-] after trim/lowercase normalization (value not echoed)",
-          requestId,
-        );
+        return errorEnvelope(400, INVALID_USER_ID_MESSAGE, requestId);
       }
       if (!normalized.includes(uid)) normalized.push(uid);
     }

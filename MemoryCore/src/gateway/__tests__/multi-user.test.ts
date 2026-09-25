@@ -909,6 +909,88 @@ describe("/v3/chat-memory/clear user-scope mode (multiUser)", () => {
     expect(store.clearCalls[0]).toEqual({ teamId: "alice", agentId: "bot-1", userId: "alice", wipeProfiles: true });
   });
 
+  it("terminal mid-sweep failure: cleared:false, zero counts, no audit (fail-loud)", async () => {
+    // 自有 scope 成功、共享时代扫尾永远失败：钉住部分失败语义（§4.2(c)）
+    // —— 重试包住整个两代 op，终败报全零计数且不发审计。
+    const clearCalls: ClearCall[] = [];
+    const audits: Array<{ record_id: string; layer: string; team_id: string }> = [];
+    const store = {
+      clearCalls,
+      audits,
+      clearMemoryContent: async (filter: ClearCall) => {
+        clearCalls.push({ ...filter });
+        if (filter.wipeProfiles === false) throw new Error("tcvdb: connection lost");
+        return { l0Deleted: 1, l1Deleted: 2, profilesDeleted: 3 };
+      },
+      appendAudit: async (entry: { record_id: string; layer: string; team_id: string }) => {
+        audits.push({ ...entry });
+      },
+    };
+    const ps = fakeProfileStorage();
+    const r = await dispatchChatMemoryClear(
+      { user_ids: ["alice"] },
+      { multiUser: true, store, storage: ps },
+    );
+    // 整体 envelope 仍 200：失败落在 per-item（all_cleared=false）
+    expect(r.status).toBe(200);
+    const items = (r.body.data?.items as Array<Record<string, unknown>>);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      memory_id: "chat_memory-alice-default",
+      cleared: false,
+      l0_deleted: 0,
+      l1_deleted: 0,
+      profile_deleted: 0,
+      retryable: true,
+      attempts: 3,
+    });
+    expect(String(items[0].reason)).toContain("retry");
+    expect(r.body.data?.all_cleared).toBe(false);
+    // 审计零落（audit 仅成功后记）
+    expect(audits).toHaveLength(0);
+    // 重试包整个两代：3 轮 × 2 代 = 6 次调用，own-era 形状 ×3 + 扫尾形状 ×3
+    expect(clearCalls).toHaveLength(6);
+    expect(clearCalls.filter((c) => c.wipeProfiles === true)).toHaveLength(3);
+    expect(clearCalls.filter((c) => c.wipeProfiles === false)).toHaveLength(3);
+    // 已删数据不回滚（文档化的低估代价）：own era 的 profile 前缀已删过 3 轮
+    expect(ps.deletedPrefixes).toHaveLength(3);
+  });
+
+  it("non-retryable failure: single attempt, no audit, cleared:false", async () => {
+    const clearCalls: ClearCall[] = [];
+    const audits: Array<{ record_id: string; layer: string; team_id: string }> = [];
+    const store = {
+      clearCalls,
+      audits,
+      clearMemoryContent: async (filter: ClearCall) => {
+        clearCalls.push({ ...filter });
+        throw new Error("clearChatMemoryContentForUser requires non-empty userId and agentId");
+      },
+      appendAudit: async (entry: { record_id: string; layer: string; team_id: string }) => {
+        audits.push({ ...entry });
+      },
+    };
+    const r = await dispatchChatMemoryClear(
+      { user_ids: ["alice"] },
+      { multiUser: true, store },
+    );
+    expect(r.status).toBe(200);
+    const items = (r.body.data?.items as Array<Record<string, unknown>>);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      memory_id: "chat_memory-alice-default",
+      cleared: false,
+      l0_deleted: 0,
+      l1_deleted: 0,
+      profile_deleted: 0,
+      retryable: false,
+      attempts: 1,
+    });
+    expect(String(items[0].reason)).toContain("rejected");
+    expect(audits).toHaveLength(0);
+    expect(clearCalls).toHaveLength(1); // 非重试错误：一次即终态
+  });
+
   it("rejects user_ids mode with 400 when multiUser is off (asset mode unaffected)", async () => {
     const r = await dispatchChatMemoryClear({ user_ids: ["alice"] }, { multiUser: false });
     expect(r.status).toBe(400);

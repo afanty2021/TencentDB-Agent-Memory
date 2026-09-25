@@ -34,6 +34,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it, onTestFailed } from "vitest";
 
+// 真实网关于进程 e2e：仅显式开启时运行（默认 skip）——与文档契约一致
+// （vitest.e2e.config.ts / PORT-NOTES / 设计文档 §6.3 均按此变量描述门禁）。
+// 运行：TDAI_E2E_REAL_GATEWAY=1 npx vitest run --config vitest.e2e.config.ts
+// （评审轮 5 发现该门禁此前只存在于文档、代码未实现——本行即落地。）
+const describeRealGateway = process.env.TDAI_E2E_REAL_GATEWAY === "1" ? describe : describe.skip;
+
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const SERVER_ENTRY = path.join(REPO_ROOT, "src", "gateway", "server.ts");
 
@@ -557,7 +563,7 @@ async function pollSqlite<T>(dbPath: string, query: () => Promise<T[]>, predicat
 // The e2e scenarios
 // ============================
 
-describe("gateway multi-user e2e (real subprocess + HTTP)", () => {
+describeRealGateway("gateway multi-user e2e (real subprocess + HTTP)", () => {
   it("routes per-user captures to isolated stores, fails closed on invalid uids, and guards /seed", async () => {
     const gw = await startGateway({ port: PORT_MULTI_USER, multiUser: true, ownerUserIds: ["ops-admin"] });
     dumpLogsOnFailure(gw);

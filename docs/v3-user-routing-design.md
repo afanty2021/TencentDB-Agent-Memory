@@ -1,8 +1,8 @@
 # v3 面按 user 路由 — 设计文档
 
-状态：**v3.3（P0+P1 全部落地）** · 2026-09-25 · 基线分支 `port/multi-user-stores`
+状态：**v3.4（P0+P1 落地 + 全量后置评审闭环）** · 2026-09-25 · 基线分支 `port/multi-user-stores`
 前置：[PORT-NOTES.md](../PORT-NOTES.md)「Out of scope」第 1 条
-修订史：v2 = 评审轮 1 修正（附录 A）；v3 = 四项决策拍板 + 实施前验证推翻两处机制假设（§2.1、附录 B）；v3.1 = 评审轮 2 修正（clear 链表述纠正、delete 剥离类、资产登记跳过、dispatch 钉测、附录 C）；v3.2 = P1 clear 链落地（user 寻址 + wipeProfiles 旗标，附录 D）+ 评审轮 3 修正（mongo profile 滤镜、契约用例、部分失败语义，附录 D 补记）；v3.3 = P1 收口（写拒绝/auto-recall 穿线/回填脚本/e2e v3 断言全落地；e2e 实证 v3 数据落 instances/{serviceId} 实例库）
+修订史：v2 = 评审轮 1 修正（附录 A）；v3 = 四项决策拍板 + 实施前验证推翻两处机制假设（§2.1、附录 B）；v3.1 = 评审轮 2 修正（clear 链表述纠正、delete 剥离类、资产登记跳过、dispatch 钉测、附录 C）；v3.2 = P1 clear 链落地（user 寻址 + wipeProfiles 旗标，附录 D）+ 评审轮 3 修正（mongo profile 滤镜、契约用例、部分失败语义，附录 D 补记）；v3.3 = P1 收口（写拒绝/auto-recall 穿线/回填脚本/e2e v3 断言全落地；e2e 实证 v3 数据落 instances/{serviceId} 实例库）；v3.4 = 评审轮 4+5 后置闭环（部分失败钉测、FTS 回填同步、e2e 门禁落地，附录 E）
 
 ---
 
@@ -128,7 +128,7 @@ multiUser:
 
 **(c) 旁路消费者（P1）**
 
-- `auto-recall.ts:163-175`：v1/standalone 面独立构造 scope，`:166` 硬编码 `{teamId:"default", agentId:"default"}` 回退。修法：v1 dispatch（multiUser 时）传入 `{teamId: uid}` 作 `profileIsolation`，保留 default 回退服务 legacy standalone。**已拍板：修。**
+- `auto-recall.ts:163-175`：v1/standalone 面独立构造 scope，`:166` 硬编码 `{teamId:"default", agentId:"default"}` 回退。修法：v1 dispatch（multiUser 时）传入 `{teamId: uid}` 作 `profileIsolation`，保留 default 回退服务 legacy standalone。**已拍板：修。**（落地更新：实际未走 dispatch 穿参，改为 per-user core 构造期注入 isolation（6d17ba9），效果等同——见 §7/§8。）
 - `clearMemoryContent`（`memory-store.ts:2016-2020`）：**已修（P1 落地，2026-09-24，附录 D）**。定案的 per-user 资产形状是**不建 per-user 元数据实体**：standalone multiUser 部署的 metadata 库是空的（上游自己的 placeholder 登记（team="default", agent="default"）在那里也只会 `agent_not_found`——资产/面板链本是 service 部署专属），为每个自然人建 user+team+agent 实体需要合成 owner（user_key 物料）、吃 team 配额、且把 team（组织语义）错配给人。取而代之，`/v3/chat-memory/clear` 增加 **user 寻址模式**（与 `memory_ids` 资产寻址互斥，同请求双字段 → 400，zod object 会剥未知键故互斥须在 schema 前显式判定）：
   - 请求 `{user_ids: string[] (≤100, trim/去重), agent_id? (缺省 "default")}`，仅 `multiUser.enabled` 下可用（否则 400）；user_id 经 `normalizeUserId` fail-closed（非法 400 报字段不报值，整批拒绝零清空），归一后去重（"Alice"/"alice" 同人）。不经过 metadata 面与资产（user 模式不要求 metadata service 可用）。
   - 每个 uid 覆盖**两代数据**：① 自有 scope（`team={uid}`）全清——L0/L1（team+user 收窄）+ per-user persona 的行与文件（`clearProfileStorage`）；② 共享时代扫尾（`team="default"` 行按 user 收窄）**跳过 profile 删除**（新 store 旗标 `wipeProfiles:false`——profiles 是 team+agent 粒度，按 user 收窄的清除若带 profile 删除会误删整个共享 persona；tcvdb/mongo 生效，sqlite 本就不在 clearMemoryContent 动 profile）。`uid="default"` 时两代重合退化为单次全清。
@@ -176,7 +176,7 @@ dispatch 在 gateway 进程内，`V2RouterDeps` 加一个 `multiUserEnabled: boo
 1. **单元（vitest，`src/gateway/__tests__/multi-user.test.ts`，P0 已落地）**
    - 纯函数 `applyMultiUserV3Routing` 矩阵：写端点 subsume（placeholder/缺席 team、真实 team 优先、`subsumedTeam` 标记）、user 维度端点剥离（读 6 + 删 2 全子路径）、归一化（大小写/ASCII trim/非法 400）、`user_id=default` 占位时行为不变（fail-open 兼容）；
    - **dispatch 级（`handleV2Route` 直调 + fake L0 store，P0 已落地）**：subsume 下 `/v3/conversation/add` 落库行 `team_id=user_id={uid}` + 资产登记跳过；flag off 时行为逐比特不变（team 保持 "default"、资产正常登记）；真实 team 优先 + 资产正常登记；`/v3/conversation/query` 滤镜无 team 维度、双代行同可见（total=2）；非法 user_id 400（错误体不含原值、零写入、零登记）。
-   - **chat-memory clear dispatch 级（P1 已落地，`handleV2Route` + `makeChatMemoryRouteTable` 直调 + fake clear store/storage）**：user 模式两代调用形状（自有 scope `wipeProfiles:true` + 扫尾 `team="default"` `wipeProfiles:false`，顺序钉死）；profile 文件只删 user 自己的 scope 前缀；计数合并；审计伪 id 同形（L1/L2/L3）；`uid="default"` 单次全清退化；归一/去重/自定义 agent_id；multiUser off → 400；非法 user_id → 400 不回显值且零清空；双模式同请求 → 400 / 双缺席 → 400；资产模式回归（multiUser on/off 均走 metadata 解析不受影响）。
+   - **chat-memory clear dispatch 级（P1 已落地，`handleV2Route` + `makeChatMemoryRouteTable` 直调 + fake clear store/storage）**：user 模式两代调用形状（自有 scope `wipeProfiles:true` + 扫尾 `team="default"` `wipeProfiles:false`，顺序钉死）；profile 文件只删 user 自己的 scope 前缀；计数合并；审计伪 id 同形（L1/L2/L3）；`uid="default"` 单次全清退化；归一/去重/自定义 agent_id；multiUser off → 400；非法 user_id → 400 不回显值且零清空；双模式同请求 → 400 / 双缺席 → 400；资产模式回归（multiUser on/off 均走 metadata 解析不受影响）；**部分失败语义 ×2（评审轮 4 补）**：可重试终败（重试包整个两代 = 6 次调用、`cleared:false` 全零计数、零审计、`attempts:3`、已删 profile 前缀不回滚）与不可重试（单次即终态 `attempts:1`、`retryable:false`、零审计）。
 2. **集成**：v3 数据面双用户回归——alice/bob 各自 conversation/add → 查询互不可见 → core_read 各自 scope（fake store 级）。
 3. **e2e（P1 已落地，2026-09-25）**：`gateway.multi-user.e2e.test.ts` 新增 v3 subsume 场景（真实网关于进程 + HTTP + mock LLM）：写门禁（缺席身份 add → 400 零落库）→ 双用户 v3 写 → **L0/L1 行 `team_id=user_id` 列级断言（真实管线）** → **per-user profile 存储域目录 `profiles/team:{uid}|agent:default/` 落盘断言**（§2.1 接缝 1 的端到端证明；L2 任务键另见子进程 trace）→ `/v3/conversation/search` 双向不可见。运行：`TDAI_E2E_REAL_GATEWAY=1 npx vitest run --config vitest.e2e.config.ts`（新配置解除默认 exclude；afterAll 停子进程偶发超时为存量 flake，P0 轮已基线定性）。**e2e 实证的新事实**：v3 数据面按 serviceId 走 store pool 实例路由，行落 `<dataDir>/instances/<serviceId>/vectors.db`（standalone 也是；v1 物理 core 面才落 `users/<uid>/`）——回填脚本 --db 须指向实例库（脚本头已注明）。
 4. **pytest（插件侧）**：现有 `test_multi_user_identity.py` 全绿不动（插件零改动，应原样通过）。
@@ -186,7 +186,7 @@ dispatch 在 gateway 进程内，`V2RouterDeps` 加一个 `multiUserEnabled: boo
 ## 7. 实施排期（已拍板后修正）
 
 - **P0（本次，网关侧）**：§4.2(a) dispatch 归一（subsume + user 维度端点剥离[含按 id 删] + 归一化 400 + `subsumedTeam` 资产登记跳过）+ server deps 接线 + §6.1 单测（纯函数矩阵 + dispatch 级钉测）。**前置条件（已拍板确认）**：`V3_STRICT_ISOLATION` 保持 off（归一后其实可开，但 P0 不改部署面）；接受共享 persona 一次冷启动；~~P0→B 数据迁移~~（同形免迁移，条件自动满足）。
-- **P1**：✅ 全部落地（2026-09-25）：§4.2(b) default 桶写拒绝 + §4.2(c) auto-recall/per-user core isolation 穿线（6d17ba9）+ 跨代回填脚本（73f1744，dry-run 默认 + --confirm，自测含幂等/保护行）+ §6.3 e2e v3 断言（含 vitest.e2e.config.ts 接线，86d260e）。clear 链先行落地并过评审轮 3（附录 D）。§6.2 集成面已被 dispatch 级钉测等价覆盖，未单列。
+- **P1**：✅ 全部落地（2026-09-25）：§4.2(b) default 桶写拒绝 + §4.2(c) auto-recall/per-user core isolation 穿线（6d17ba9）+ 跨代回填脚本（73f1744，dry-run 默认 + --confirm，自测含幂等/保护行）+ §6.3 e2e v3 断言（含 vitest.e2e.config.ts 接线，178edcb）。clear 链先行落地并过评审轮 3（附录 D）。§6.2 集成面已被 dispatch 级钉测等价覆盖，未单列。
 - **P2**：文档转正 + pytest 钉测复核。
 - **P3（09-29 上游 PR 材料）**：以"per-user routing via team-slot normalization at dispatch"独立 feature 进 PR；B（3 段语法）作为上游反馈时的升级路径备选写入讨论。
 
@@ -196,7 +196,7 @@ dispatch 在 gateway 进程内，`V2RouterDeps` 加一个 `multiUserEnabled: boo
 
 1. **目标形态：B′（系统化顶替）** ✅ —— 实施形态经 §2.1 验证修正为 **subsume**（userId 并入 teamId），而非字面"顶替"（剥离 teamId）；两者的差异即 §2.1 四接缝。
 2. **P0 先行** ✅ —— 三前置确认：strict isolation 保持 off；接受共享 persona 一次冷启动；P0→B 数据迁移（后经同形结论免除，跨代会话回填列为 P1 可选项）。
-3. **default 桶写拒绝** ✅（P1）；**clearMemoryContent 按 per-user 收窄** ✅/⚠️ —— store 层原语达成（team 列即 user）；但管理面 `/v3/chat-memory/clear` 链在 subsume 下断裂（无 per-user 资产 → 静默 no-op 返回 `cleared: true`），**per-user 资产 + clear 链列 P1**（§4.2(c)，评审轮 2 纠正了"零改码达成"的原表述）；**auto-recall.ts 修** ✅（P1，v1 dispatch 穿 `profileIsolation`）。
+3. **default 桶写拒绝** ✅（P1）；**clearMemoryContent 按 per-user 收窄** ✅/⚠️ —— store 层原语达成（team 列即 user）；但管理面 `/v3/chat-memory/clear` 链在 subsume 下断裂（无 per-user 资产 → 静默 no-op 返回 `cleared: true`），**per-user 资产 + clear 链列 P1**（§4.2(c)，评审轮 2 纠正了"零改码达成"的原表述）；**auto-recall.ts 修** ✅（P1；落地机制为 per-user core 构造期注入 isolation `{teamId: uid, userId: uid}`（`server.ts`/`tdai-core.ts`，6d17ba9），非 dispatch 穿 `profileIsolation`——评审轮 5 纠正此处的原表述，效果等同）。
 4. **机制修正两处（实施前验证，详见 §2.1/附录 B）**：P0 由"插件省略 team_id"改为"网关 dispatch 归一"（原方案会静默失效且更晚发现）；B′ 由"剥离"改为"并入"。决策意图（最快最稳解封 per-user L2/L3）不变，实现路径更稳。
 
 ---
@@ -247,3 +247,24 @@ per-user 资产形状定案：**不建实体，clear 面加 user 寻址**（§4.
 - **I2（已补，休眠态如实标注）**：per-user 清空契约用例加入 `__contract__/memory-store.contract.ts`（两形状钉死：扫尾 `userId+wipeProfiles:false` profile 零删；自有 scope `userId` 缺省全删含 `user_id=""` 管线行 + 旁观 team 不动）。**注**：本分支无任何后端 spec 消费该契约套件（全树仅 3 个 test 文件）——该用例此刻不被执行，待后端 harness 接线（上游 CI）后生效；mongo 修复的本地验证以 tcvdb 参照镜像 + 类型检查 + 全量套件为凭。
 - **I3（已文档化）**：部分失败语义明示（代码注释 + 本节）：重试包住整个两代清除，自有 scope 已清成而共享扫尾终败时，item 报 `cleared:false` + 全零计数且不发审计——fail-loud + 幂等重试（audit 落在成功那次），终败响应低估已删量，靠 error 日志与重试收敛；逐代计数/审计列 P2 候选。
 - Minor：门控与解析先后（先 zod 后 multiUser 门，均为 400，不改）；user 模式 `agent_id` 仅 trim 不做值域（管理面凭据信任级，记一笔）；文档"profiles 按 team+agent"表述随 C1 修复后两后端皆成立。
+
+### 附录 E：评审轮 4+5 后置闭环（2026-09-25，全部提交后）
+
+两轮独立 subagent 评审（各自列级追踪 + 临时 worktree 重跑测试/构建），范围合并覆盖 4ba9dc1..178edcb 全部提交。轮 4 = clear 链两提交（7520e69+d7a0932）；轮 5 = P1 余项三提交（6d17ba9/73f1744/178edcb——轮 4 派发时发现 HEAD 已越过 d7a0932，补派）。两轮均**无 Critical**。
+
+**轮 4（With fixes，1I/4M）**，实测 48/48 + tsdown clean。列级核验通过项：三后端 `clearMemoryContent` 滤镜（L0/L1 按 user 收窄、profile 恒 team+agent、wipeProfiles 落地、sqlite 恒 0 构造成立）；两代形状匹配真实行 population（own-era 无 `user_id=""` 的 L0/L1 行——管线继承 userId，该 population 仅存在于 profile）；clear 路由不经 `applyMultiUserV3Routing`（isV3Extra 面，与 handler 的 LEGACY_TEAM_ID 无冲突）；重试幂等收敛（`deleteByPrefix` 缺前缀 no-throw）；审计/响应与资产模式同形；`agent_id` 注入面安全（参数化/escape/encodeURIComponent）。修复：
+
+- **I1 部分失败零覆盖（已修）**：user 模式 catch 分支无任何测试执行。补 dispatch 钉测 2 条（§6.1-3）：可重试终败（6 次调用 = 重试包整个两代、零审计、`attempts:3`、已删 profile 前缀不回滚）+ 不可重试（单次终态 `attempts:1`）。
+- **M1 契约文件 TS2774（已修）**：`isRowStore && store.syncProfiles` 冗余判定致独立 tsc 失败——同时暴露该文件不入 tsdown/vitest 编译面（"类型检查"声明不实）。去冗余后独立 tsc 干净。
+- **M3 400 文案重复（已修）**：`INVALID_USER_ID_MESSAGE` 抽入 utils/user-id.ts 单源（dispatch 门禁与 clear 面共用）。
+- M2 api 参考文档未收 user 模式（P2 文档转正）；M4 后端既有不对称（mongo 空串 userId 语义 / `isNonRetryableClearError` 不匹配 mongo 错误串）——不可达自本改动面，记档。
+
+**轮 5（With fixes，3I/4M）**，实测（178edcb worktree）：默认套件 52/52（multi-user 37）、e2e 5/5（存量 afterAll flake 特征不变）、tsdown clean、插件 pytest 48 passed+3 skipped、回填脚本 seeded 临时库全程行为验证。核验通过项：写门禁检查序（归一 400 → 占位写 400 → 剥离 → subsume）与成员完整性（5 条写端点精确覆盖 18 条 allowed 的变异面，无读端点误伤、无 v3 漏网写路径）；flag off 零行为变化；插件身份链 + 优雅降级 → 无部署排序 Critical；穿线 per-core 实例化无跨 user 泄漏；e2e 为真子进程 + HTTP + 仅 LLM 边界 mock，红线（拒 8420/仅 tmpdir/清洗子进程环境）代码强制；默认套件隔离保持。修复：
+
+- **I1 FTS"无需同步"声明为假（已修）**：`l0_fts/l1_fts` 的 team_id/user_id/agent_id 是 UNINDEXED 冗余列，`searchL0Fts/searchL1Fts` 直接在 FTS 行上过滤（仅 vec0 走基表水合）——只回填基表会造成 FTS vs 基表可见性分叉（当下潜伏，/v2 过滤或回滚 multiUser 即激活）。脚本 `--confirm` 事务现同步两 FTS 表（FTS 不可用部署检测表缺席即跳过）。
+- **I2 TDAI_E2E_REAL_GATEWAY 门禁只在文档（已修）**：四处置文档声明该 env 门禁、测试文件零实现（评审者实测不设变量照样全量起子进程）。已落地 `describe.skipIf`。
+- **I3 脚本头夸大写门禁覆盖（已修）**："新写入不可能再落共享桶"对 /v2 面不成立（routing 钩子仅 v3）。改 v3 面限定 + /v2 写入方存在则重跑（幂等）。
+- **M4/M5/M6（已修）**：§7 悬空哈希 86d260e→178edcb；§4.2(c)/§8 auto-recall 机制表述改构造期注入；回填诊断 PRAGMA 空集判缺席（"表不存在"分支真正可达）+ `--db` 不含 `/instances/` 打 ⚠（根库/v1 库回填 = 把共享行归个人 scope 的操作风险）。
+- M7 记档：e2e profile 目录断言证明 L2 任务键、未钉 L1 requery 匹配（commit 措辞略过强）；回填脚本无 committed 自动测试；显式 `user_id="default"` 写形状仅纯函数级钉测（缺席形状经 resolveIsolation 补位后同分支）。
+
+**推荐项处置**：契约套件接 sqlite 本地激活（轮 4 Rec-1）**缓行**——需引入 sqlite harness spec 且既有两用例的 sqlite 语义未验证，09-29 上游 PR 随后端 harness 激活更稳妥；回填脚本 committed vitest 用例、伪 id 审计两代 conflation 拆分（拆分时 `team_id` 须区分 uid 与 "default"）均列 P2。

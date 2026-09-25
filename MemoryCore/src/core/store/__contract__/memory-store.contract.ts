@@ -412,7 +412,7 @@ export function runMemoryStoreContract(harness: MemoryStoreContractHarness): voi
         await store.upsertL0(makeL0("l0-alice", "alice content", { teamId: "team-a", agentId: "agent-x", userId: "alice" }));
         await store.upsertL0(makeL0("l0-bob", "bob content", { teamId: "team-a", agentId: "agent-x", userId: "bob" }));
         await store.upsertL1(makeL1("l1-alice", "alice memory", { teamId: "team-a", agentId: "agent-x", userId: "alice" } as Partial<MemoryRecord>));
-        if (isRowStore && store.syncProfiles) {
+        if (isRowStore) {
           const ts = Date.now();
           await store.syncProfiles([
             {
@@ -445,7 +445,7 @@ export function runMemoryStoreContract(harness: MemoryStoreContractHarness): voi
         expect(res.profilesDeleted).toBe(0);
         expect(await store.countL0({ teamId: "team-a", agentId: "agent-x", userId: "alice" })).toBe(0);
         expect(await store.countL0({ teamId: "team-a", agentId: "agent-x", userId: "bob" })).toBeGreaterThanOrEqual(1);
-        if (isRowStore && store.syncProfiles) {
+        if (isRowStore) {
           expect((await store.queryProfiles({ teamId: "team-a" })).length).toBe(2);
         }
 
@@ -453,7 +453,7 @@ export function runMemoryStoreContract(harness: MemoryStoreContractHarness): voi
         //    profile 行**全删**——直写行（user_id=alice）与管线行（user_id=""）
         //    都必须删掉，绝不按 user 收窄；旁观 team 不动
         const res2 = await store.clearMemoryContent({ teamId: "team-a", agentId: "agent-x", userId: "alice" });
-        if (isRowStore && store.syncProfiles) {
+        if (isRowStore) {
           expect(res2.profilesDeleted).toBeGreaterThanOrEqual(2);
           expect((await store.queryProfiles({ teamId: "team-a" })).length).toBe(0);
           expect((await store.queryProfiles({ teamId: "team-b" })).length).toBe(1);

@@ -34,6 +34,15 @@ const USER_ID_PATTERN = /^[a-z0-9_-]{1,64}$/;
 export const DEFAULT_USER_ID = "default";
 
 /**
+ * Shared 400 message for a rejected user id — reports the FIELD, never the
+ * value (fail-closed no-echo contract). Single-sourced so the v3 dispatch
+ * gate (`applyMultiUserV3Routing`) and the user_ids clear mode cannot drift
+ * apart in wording.
+ */
+export const INVALID_USER_ID_MESSAGE =
+  "Invalid user_id: must be 1-64 chars of [a-z0-9_-] after trim/lowercase normalization (value not echoed)";
+
+/**
  * Normalize a raw user id.
  *
  * @returns the normalized id, or `null` when the input is not a string, is

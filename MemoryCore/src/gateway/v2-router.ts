@@ -28,7 +28,7 @@ import { executeMemorySearch } from "../core/tools/memory-search.js";
 import { executeConversationSearch } from "../core/tools/conversation-search.js";
 import type { MemoryRecord } from "../core/record/l1-writer.js";
 import { reportRecallMetrics } from "../core/report/metric-tracking-recall.js";
-import { normalizeUserId } from "../utils/user-id.js";
+import { INVALID_USER_ID_MESSAGE, normalizeUserId } from "../utils/user-id.js";
 
 // ── Zod schemas (validated types + defaults) ──
 import {
@@ -244,7 +244,7 @@ export type V3IsolationCtx = { teamId?: string; userId: string; agentId: string;
 export function applyMultiUserV3Routing(ctx: V3IsolationCtx, v3Subpath: string): { ok: true; ctx: V3IsolationCtx } | { ok: false; error: string } {
   const uid = normalizeUserId(ctx.userId);
   if (uid === null) {
-    return { ok: false, error: "Invalid user_id: must be 1-64 chars of [a-z0-9_-] after trim/lowercase normalization (value not echoed)" };
+    return { ok: false, error: INVALID_USER_ID_MESSAGE };
   }
   if (V3_WRITE_SUBPATHS.has(v3Subpath) && uid === USER_ID_PLACEHOLDER) {
     return {
