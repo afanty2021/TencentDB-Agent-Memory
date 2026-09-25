@@ -390,5 +390,81 @@ export function runMemoryStoreContract(harness: MemoryStoreContractHarness): voi
         await harness.disposeStore(store);
       }
     });
+
+    // per-user 清空契约（multiUser subsume 布局，docs/v3-user-routing-design.md
+    // §4.2(c)）。行存后端（isProfileRowStore）必须满足：
+    //   - L0/L1 内容行按 (team, agent[, user]) 收窄；
+    //   - profile 行**永远 team+agent 粒度**——per-user persona 是混合列
+    //     population（网关直写行带 user_id，管线经 scope 解析生成的行
+    //     user_id=""），按 user 收窄 profile 删除会漏掉管线行，留下
+    //     "报 cleared 却没清干净"的 persona 正文（mongo 曾犯此错）；
+    //   - wipeProfiles:false 只跳过 profile 删除，不影响内容行。
+    // sqlite 等 profile 非行存后端不受 profile 断言约束（clearMemoryContent
+    // 本就不动 profile，profilesDeleted 恒 0）。
+    it("clearMemoryContent narrows L0/L1 by user but never profiles; wipeProfiles:false skips profile rows", async () => {
+      const store = await harness.createStore();
+      if (!store.clearMemoryContent) {
+        await harness.disposeStore(store);
+        return;
+      }
+      try {
+        const isRowStore = isProfileRowStore(store);
+        await store.upsertL0(makeL0("l0-alice", "alice content", { teamId: "team-a", agentId: "agent-x", userId: "alice" }));
+        await store.upsertL0(makeL0("l0-bob", "bob content", { teamId: "team-a", agentId: "agent-x", userId: "bob" }));
+        await store.upsertL1(makeL1("l1-alice", "alice memory", { teamId: "team-a", agentId: "agent-x", userId: "alice" } as Partial<MemoryRecord>));
+        if (isRowStore && store.syncProfiles) {
+          const ts = Date.now();
+          await store.syncProfiles([
+            {
+              id: "profile:contract:wipe:alice", type: "l2", filename: "alice.md",
+              content: "gateway write-through", contentMd5: "md5-a",
+              teamId: "team-a", agentId: "agent-x", userId: "alice",
+              version: 1, createdAtMs: ts, updatedAtMs: ts,
+            },
+            {
+              // 管线行的形状：scope 解析回 {teamId}，无 userId → 落库 ""
+              id: "profile:contract:wipe:pipeline", type: "l3", filename: "persona.md",
+              content: "pipeline-generated persona", contentMd5: "md5-p",
+              teamId: "team-a", agentId: "agent-x",
+              version: 1, createdAtMs: ts, updatedAtMs: ts,
+            },
+            {
+              id: "profile:contract:wipe:bystander", type: "l2", filename: "bystander.md",
+              content: "team-b bystander", contentMd5: "md5-b",
+              teamId: "team-b", agentId: "agent-x",
+              version: 1, createdAtMs: ts, updatedAtMs: ts,
+            },
+          ]);
+        }
+
+        // ① 共享时代扫尾形状（userId + wipeProfiles:false）：内容行按人删，
+        //    profile 一行不动（含该 user 的直写行——收窄防误删是它的职责）
+        const res = await store.clearMemoryContent({ teamId: "team-a", agentId: "agent-x", userId: "alice", wipeProfiles: false });
+        expect(res.l0Deleted).toBeGreaterThanOrEqual(1);
+        expect(res.l1Deleted).toBeGreaterThanOrEqual(1);
+        expect(res.profilesDeleted).toBe(0);
+        expect(await store.countL0({ teamId: "team-a", agentId: "agent-x", userId: "alice" })).toBe(0);
+        expect(await store.countL0({ teamId: "team-a", agentId: "agent-x", userId: "bob" })).toBeGreaterThanOrEqual(1);
+        if (isRowStore && store.syncProfiles) {
+          expect((await store.queryProfiles({ teamId: "team-a" })).length).toBe(2);
+        }
+
+        // ② 自有 scope 形状（userId + wipeProfiles 缺省 true）：team-a 的
+        //    profile 行**全删**——直写行（user_id=alice）与管线行（user_id=""）
+        //    都必须删掉，绝不按 user 收窄；旁观 team 不动
+        const res2 = await store.clearMemoryContent({ teamId: "team-a", agentId: "agent-x", userId: "alice" });
+        if (isRowStore && store.syncProfiles) {
+          expect(res2.profilesDeleted).toBeGreaterThanOrEqual(2);
+          expect((await store.queryProfiles({ teamId: "team-a" })).length).toBe(0);
+          expect((await store.queryProfiles({ teamId: "team-b" })).length).toBe(1);
+        } else {
+          expect(res2.profilesDeleted).toBe(0);
+        }
+        // ② 带 userId=alice：bob 的内容行不受影响
+        expect(await store.countL0({ teamId: "team-a", agentId: "agent-x", userId: "bob" })).toBeGreaterThanOrEqual(1);
+      } finally {
+        await harness.disposeStore(store);
+      }
+    });
   });
 }
