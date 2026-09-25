@@ -196,6 +196,25 @@ const V3_USER_SCOPED_SUBPATHS = new Set<string>([
 /** The plugin client's placeholder team ("default") — treated as absent under multiUser routing. */
 const TEAM_ID_PLACEHOLDER = "default";
 
+/** The isolation placeholder user ("default", filled by resolveIsolation for absent identity). */
+const USER_ID_PLACEHOLDER = "default";
+
+/**
+ * v3 数据面**写**端点（§4.2(b) default 桶写拒绝）：这些端点在身份缺席
+ * （归一化后为 `"default"` 占位）时会把数据写进共享桶 / 覆盖共享 persona
+ * —— multiUser 下 fail-closed 拒绝，要求显式 user_id（真实 team_id 在场
+ * 也不豁免：L0/L1 行与 L2/L3 scope 仍带 user 维度）。profile 读
+ * （scenario/ls|read|count、core/read|count）与 L0/L1 user 维度端点
+ * （读 + 按 id 删）不门禁（fail-open 保持，读历史不丢）。
+ */
+const V3_WRITE_SUBPATHS = new Set<string>([
+  "/conversation/add",
+  "/atomic/update",
+  "/scenario/write",
+  "/scenario/rm",
+  "/core/write",
+]);
+
 /**
  * Isolation ctx shape as attached to {@link V2RouterDeps.requestIsolation}.
  * `subsumedTeam` is set by multiUser routing when it rewrote teamId := userId
@@ -215,8 +234,10 @@ export type V3IsolationCtx = { teamId?: string; userId: string; agentId: string;
  * 规则（v3Subpath ∈ V3_ALLOWED_SUBPATHS 时才被调用）：
  *   1. user_id 归一化（normalizeUserId，与插件侧逐字对齐），非法 → fail-closed
  *      400（报字段不报值——userId 即将进 team 槽，这里封死 scope/filter 注入）。
- *   2. L0/L1 user 维度端点（读 + 按 id 删）：剥离 teamId（undefined = 不限 team）。
- *   3. 写/profile 端点：teamId 缺省或为 placeholder "default" 时 := userId
+ *   2. 写端点身份缺席拒绝（§4.2(b)）：写端点 + 归一后 user_id 为 "default"
+ *      占位 → 400（共享桶从此只读；读端点不门禁）。
+ *   3. L0/L1 user 维度端点（读 + 按 id 删）：剥离 teamId（undefined = 不限 team）。
+ *   4. 写/profile 端点：teamId 缺省或为 placeholder "default" 时 := userId
  *      并标记 subsumedTeam；真实 team_id 在场则不动（team 语义优先，
  *      multiUser 模式假设无真实 team）。
  */
@@ -224,6 +245,12 @@ export function applyMultiUserV3Routing(ctx: V3IsolationCtx, v3Subpath: string):
   const uid = normalizeUserId(ctx.userId);
   if (uid === null) {
     return { ok: false, error: "Invalid user_id: must be 1-64 chars of [a-z0-9_-] after trim/lowercase normalization (value not echoed)" };
+  }
+  if (V3_WRITE_SUBPATHS.has(v3Subpath) && uid === USER_ID_PLACEHOLDER) {
+    return {
+      ok: false,
+      error: "user_id is required on v3 write endpoints under multiUser.enabled: absent identity resolves to the shared \"default\" bucket which is read-only; send an explicit user_id",
+    };
   }
   if (V3_USER_SCOPED_SUBPATHS.has(v3Subpath)) {
     const { teamId: _dropped, subsumedTeam: _marker, ...rest } = ctx;

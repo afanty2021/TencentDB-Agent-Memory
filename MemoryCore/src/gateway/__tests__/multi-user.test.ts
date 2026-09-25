@@ -165,6 +165,54 @@ describe("multiUser config loading", () => {
 // ============================
 
 describe("TdaiGateway per-user core routing", () => {
+  it("per-user core capture stamps userId on the L0 JSONL mirror", async () => {
+    // 写侧钉测（§4.2(c)）：isolation 注入后 capture 的 L0 落 user 列
+    //（向量行列由 sqlite 归一逻辑兜底，JSONL 镜像是可断言的可见面）。
+    const { gw, resolve, baseDir } = makeGateway({ enabled: true });
+    try {
+      const wendy = await resolve("wendy");
+      await wendy.handleTurnCommitted({
+        userText: "hi", assistantText: "hello",
+        messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "hello" }],
+        sessionKey: "s1", sessionId: "s1",
+      });
+      const jsonl = readAllJsonl(path.join(baseDir, "users", "wendy", "conversations"));
+      expect(jsonl).toContain('"userId":"wendy"');
+    } finally {
+      await gw.stop();
+    }
+  });
+
+  it("auto-recall reads the user's own team:{uid} scope; main core stays on the default scope", async () => {
+    // §4.2(c) auto-recall 穿线（P1）：per-user core 注入 isolation 后，
+    // capture 落列 team/user、L2 键 team:{uid}|agent:default、recall 的
+    // profileIsolation 同 scope —— 与 v3 subsume 世界同形。主 core 不注入，
+    // 保持 legacy default 桶行为。
+    const { gw, resolve, baseDir } = makeGateway({ enabled: true });
+    try {
+      const main = await resolve(undefined);
+      const wendy = await resolve("wendy");
+
+      // 两个 scope 各放一份 persona（路径规则 = buildProfileIsolationScope + encodeURIComponent）
+      const scopeDir = (scope: string, root: string) =>
+        path.join(root, "profiles", encodeURIComponent(scope));
+      const wendyDir = scopeDir("team:wendy|agent:default", path.join(baseDir, "users", "wendy"));
+      const mainDir = scopeDir("team:default|agent:default", baseDir);
+      fs.mkdirSync(wendyDir, { recursive: true });
+      fs.mkdirSync(mainDir, { recursive: true });
+      fs.writeFileSync(path.join(wendyDir, "persona.md"), "wendy-persona-content");
+      fs.writeFileSync(path.join(mainDir, "persona.md"), "main-default-persona");
+
+      const wendyRecall = await wendy.handleBeforeRecall("hello", "s1");
+      expect(wendyRecall?.recalledL3Persona ?? "").toContain("wendy-persona-content");
+
+      const mainRecall = await main.handleBeforeRecall("hello", "s1");
+      expect(mainRecall?.recalledL3Persona ?? "").toContain("main-default-persona");
+    } finally {
+      await gw.stop();
+    }
+  });
+
   it("routes regular users to lazily-created cores rooted at <baseDir>/users/<uid>", async () => {
     const { gw, resolve, baseDir } = makeGateway({ enabled: true, ownerUserIds: ["huangzhengbo"] });
     try {
@@ -502,15 +550,34 @@ describe("applyMultiUserV3Routing (v3 data-plane per-user ctx rewrite)", () => {
     }
   });
 
-  it("keeps 'default' placeholder user_id behavior unchanged (fail-open compat)", () => {
-    // No explicit identity: subsume maps default→default (no-op), reads keep
-    // the placeholder user filter. P0 stays fail-open; the write gate is P1.
-    const write = applyMultiUserV3Routing(ctx({ userId: "default" }), "/conversation/add");
-    expect(write.ok && write.ctx.teamId).toBe("default");
-    expect(write.ok && write.ctx.userId).toBe("default");
+  it("reads stay fail-open with the placeholder user_id; profile reads are not gated", () => {
+    // 无显式身份的读保持 fail-open（读历史不丢）；P1 起**写**端点拒绝
+    // placeholder 身份（见下一条），读写行为在这里分家。
     const read = applyMultiUserV3Routing(ctx({ userId: "default" }), "/conversation/query");
     expect(read.ok && read.ctx.teamId).toBeUndefined();
     expect(read.ok && read.ctx.userId).toBe("default");
+    for (const sub of ["/core/read", "/core/count", "/scenario/ls", "/scenario/read", "/scenario/count"]) {
+      const r = applyMultiUserV3Routing(ctx({ userId: "default" }), sub);
+      expect(r.ok).toBe(true); // profile 读不门禁（落在共享 scope）
+      if (r.ok) expect(r.ctx.teamId).toBe("default");
+    }
+  });
+
+  it("rejects placeholder-identity writes on every write endpoint (§4.2(b) default-bucket write gate)", () => {
+    for (const sub of ["/conversation/add", "/atomic/update", "/scenario/write", "/scenario/rm", "/core/write"]) {
+      const r = applyMultiUserV3Routing(ctx({ userId: "default" }), sub);
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.error).toContain("user_id");
+        expect(r.error).toContain("multiUser.enabled");
+      }
+    }
+    // 真实 team_id 不豁免写门禁：L0/L1 行与 L2/L3 scope 仍带 user 维度
+    const realTeam = applyMultiUserV3Routing(ctx({ userId: "default", teamId: "real-team" }), "/conversation/add");
+    expect(realTeam.ok).toBe(false);
+    // 显式身份的写放行（对照）
+    const explicit = applyMultiUserV3Routing(ctx({ userId: "alice" }), "/conversation/add");
+    expect(explicit.ok).toBe(true);
   });
 });
 
@@ -674,6 +741,25 @@ describe("v3 dispatch wiring (multiUser subsume at handleV2Route level)", () => 
     expect(r.body.message).not.toContain("wendy.li");
     expect(store.rows).toHaveLength(0);
     expect(r.assetRegistrations).toBe(0);
+  });
+
+  it("§4.2(b): rejects identity-less writes (400, zero rows), reads stay fail-open", async () => {
+    const store = fakeL0Store();
+    // 缺席 user_id → resolveIsolation 补 "default" → 写门禁 400
+    const absent = await dispatchV3(store, "/conversation/add", {
+      team_id: "default", agent_id: "default", session_id: "s1",
+      messages: [{ role: "user", content: "identity-less write" }],
+    }, { multiUser: true });
+    expect(absent.status).toBe(400);
+    expect(absent.body.message).toContain("user_id");
+    expect(absent.body.message).toContain("multiUser.enabled");
+    expect(store.rows).toHaveLength(0);
+
+    // 对照：读端点同身份缺席仍 fail-open 200
+    const read = await dispatchV3(store, "/conversation/query", {
+      team_id: "default", agent_id: "default", session_id: "s1",
+    }, { multiUser: true });
+    expect(read.status).toBe(200);
   });
 });
 

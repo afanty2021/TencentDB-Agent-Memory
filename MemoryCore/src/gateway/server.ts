@@ -632,6 +632,9 @@ export class TdaiGateway {
       hostAdapter: adapter,
       config: this.config.memory,
       sessionFilter: new SessionFilter(this.config.memory.capture.excludeAgents),
+      // 与 v3 subsume 世界同形：本 core 的 L0 行/L2 键/auto-recall scope 全落
+      // team:{uid}|agent:default（主 core 不注入 → legacy default 桶行为不变）。
+      isolation: { teamId: uid, userId: uid },
     });
 
     const entry: UserCoreEntry = { core, ready: core.initialize(), lastAccess: Date.now() };

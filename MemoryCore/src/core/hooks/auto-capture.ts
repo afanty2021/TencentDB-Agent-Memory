@@ -47,6 +47,13 @@ export async function performAutoCapture(params: {
   messages: unknown[];
   sessionKey: string;
   sessionId?: string;
+  /**
+   * Tenancy columns for the L0 vector rows (multiUser per-user core passes
+   * `{teamId: uid, userId: uid}`; absent → rows land in the default bucket,
+   * matching the legacy standalone behavior).
+   */
+  teamId?: string;
+  userId?: string;
   cfg: MemoryTdaiConfig;
   pluginDataDir: string;
   logger?: Logger;
@@ -87,7 +94,7 @@ export async function performAutoCapture(params: {
   storage?: StorageAdapter;
 }): Promise<AutoCaptureResult> {
   const {
-    messages, sessionKey, sessionId, cfg, pluginDataDir, logger, scheduler,
+    messages, sessionKey, sessionId, teamId, userId, cfg, pluginDataDir, logger, scheduler,
     originalUserText, originalUserMessageCount, pluginStartTimestamp,
     vectorStore, embeddingService, bgTaskRegistry, storage,
   } = params;
@@ -122,6 +129,7 @@ export async function performAutoCapture(params: {
         filteredMessages = await recordConversation({
           sessionKey,
           sessionId,
+          ...(userId ? { userId } : {}),
           rawMessages: messages,
           baseDir: pluginDataDir,
           logger,
@@ -185,6 +193,8 @@ export async function performAutoCapture(params: {
           id: generateL0RecordId(sessionKey, i),
           sessionKey,
           sessionId: sessionId || DEFAULT_ISOLATION_ID,
+          teamId,
+          userId,
           role: msg.role,
           messageText: msg.content,
           recordedAt: now,

@@ -137,6 +137,17 @@ export interface TdaiCoreOptions {
    * （零耦合：OpenClaw 无 MetadataService 场景仍可安全构造）。
    */
   skillAssetHooks?: SkillAssetHooks;
+  /**
+   * 可选：本 core 的隔离身份（multiUser per-user core 注入 `{teamId: uid,
+   * userId: uid}`，见 gateway `getCoreForUser`）。
+   *
+   * 写侧：capture 的 L0 行带上 team/user 列 → L1 分组 → L2/L3 scope 全链
+   * 落在 `team:{uid}|agent:default`，与 v3 subsume 世界同形。
+   * 读侧：auto-recall 的 profileIsolation 用它（替代 auto-recall.ts 内
+   * 硬编码的 `{teamId:"default"}` 回退）。
+   * 不注入（undefined）→ 两侧行为与既有 standalone 完全一致（default 桶）。
+   */
+  isolation?: { teamId?: string; userId?: string; agentId?: string };
 }
 
 // ============================
@@ -189,6 +200,8 @@ export class TdaiCore {
    * 见 `SkillAssetHooks` 的 doc。undefined = 不挂钩子（既有 standalone 老行为）。
    */
   private skillAssetHooks?: SkillAssetHooks;
+  /** 本 core 的隔离身份（multiUser per-user core 注入；undefined = legacy default 桶）。 */
+  private isolation?: { teamId?: string; userId?: string; agentId?: string };
   /**
    * B1 fix: in-flight guard for `ensureSkillModuleWired()`. The original guard
    * was a sync `if (this.skillCore) return`, but assignment to `skillCore`
@@ -231,6 +244,7 @@ export class TdaiCore {
     this.instanceId = opts.instanceId;
     this.storage = opts.storage;
     this.skillAssetHooks = opts.skillAssetHooks;
+    this.isolation = opts.isolation;
   }
 
   // ============================
@@ -385,6 +399,11 @@ export class TdaiCore {
       vectorStore: this.vectorStore,
       embeddingService: this.embeddingService,
       storage: this.storage,
+      // multiUser per-user core：persona/scene 读自己的 team:{uid} scope
+      //（与 capture 写侧同形）；undefined → auto-recall 的 default 回退。
+      ...(this.isolation?.teamId
+        ? { profileIsolation: { teamId: this.isolation.teamId, agentId: this.isolation.agentId ?? "default" } }
+        : {}),
     });
     const recallLatencyMs = performance.now() - tStart;
 
@@ -417,6 +436,10 @@ export class TdaiCore {
       messages: turn.messages,
       sessionKey: turn.sessionKey,
       sessionId: turn.sessionId,
+      // multiUser per-user core：L0 行带 team/user 列（L1 分组 → L2/L3 scope
+      // 同 v3 subsume 形状）；undefined → 缺席列落 default 桶（既有行为）。
+      ...(this.isolation?.teamId ? { teamId: this.isolation.teamId } : {}),
+      ...(this.isolation?.userId ? { userId: this.isolation.userId } : {}),
       cfg: this.cfg,
       pluginDataDir: this.dataDir,
       logger: this.logger,
