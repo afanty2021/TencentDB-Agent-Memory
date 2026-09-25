@@ -10,6 +10,17 @@
  *   - 审计：每个 memory_id 按 L1/L2/L3 各记一条 delete 事件，只记
  *     memory_id + 时间 + 结果，**不保留任何原内容**。
  *
+ * 两种寻址模式（互斥，同请求同时出现 → 400）：
+ *   - `{memory_ids}`（资产寻址，面板/service 部署）：经 MetadataService 解析
+ *     资产 → (team, agent)，需要 metadata service 可用。
+ *   - `{user_ids, agent_id?}`（user 寻址，multiUser 部署，见
+ *     docs/v3-user-routing-design.md §4.2(c)）：**不经过 metadata 面与资产**
+ *     （multiUser 下 team 槽位是 userId 冒名，无 per-user 资产可解析）。
+ *     每个 uid 覆盖两代数据：user 自己的 scope（team={uid}，含其 per-user
+ *     persona 的行与文件）+ 共享时代扫尾（team="default" 行按 user 收窄、
+ *     跳过 profile 删除以防误删共享 persona）。memory_id 返回确定性伪 id
+ *     `chat_memory-{uid}-{agent}`（与真实资产 id 同构，审计两模式同形）。
+ *
  * 鉴权模型（与 L0–L3 数据面一致）：
  *   内核把 Bearer + x-tdai-service-id 视为可信的管理员级凭据，**不做用户级
  *   鉴权**、不解析 x-tdai-user-key —— 与 conversation/delete、atomic/delete
@@ -32,6 +43,8 @@ import { StoragePaths } from "../core/storage/types.js";
 import { createScopedStorageAdapter, scopeProfileStorageView, type StorageAdapter } from "../core/storage/adapter.js";
 import { buildProfileIsolationScope } from "../core/profile/profile-scope.js";
 import { MetadataError, type MetadataService } from "../metadata/service/metadata-service.js";
+import { buildChatMemoryAssetId } from "../metadata/utils/chat-memory-asset.js";
+import { normalizeUserId } from "../utils/user-id.js";
 import type { Logger } from "../core/types.js";
 
 const TAG = "[chat-memory-handlers]";
@@ -59,6 +72,37 @@ export const chatMemoryClearRequestSchema = z.object({
   (data) => data.memory_ids.length > 0,
   { message: "memory_ids must contain at least one non-empty id" },
 );
+
+/**
+ * user 寻址模式（multiUser 部署）：`{user_ids, agent_id?}`。
+ *
+ * 这里只做形状/去重/trim；user_id 值域校验（normalizeUserId fail-closed）
+ * 在 handler 里做，以复用与数据面一致的"报字段不报值"错误契约。
+ */
+export const chatMemoryUserClearRequestSchema = z.object({
+  user_ids: z.array(z.string()).min(1).max(CHAT_MEMORY_CLEAR_MAX),
+  agent_id: z.string().optional(),
+}).transform((data) => {
+  const seen = new Set<string>();
+  const userIds: string[] = [];
+  for (const raw of data.user_ids) {
+    const id = raw.trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    userIds.push(id);
+  }
+  const agentId = (data.agent_id ?? "").trim() || DEFAULT_CLEAR_AGENT_ID;
+  return { user_ids: userIds, agent_id: agentId };
+}).refine(
+  (data) => data.user_ids.length > 0,
+  { message: "user_ids must contain at least one non-empty id" },
+);
+
+/** user 寻址模式的 agent 缺省：与插件侧 placeholder 一致。 */
+export const DEFAULT_CLEAR_AGENT_ID = "default";
+
+/** 共享时代的 team 占位（v2-router 的 TEAM_ID_PLACEHOLDER 同值同义）。 */
+export const LEGACY_TEAM_ID = "default";
 
 /** 单个 memory 的清空结果。 */
 export interface ChatMemoryClearItem {
@@ -98,6 +142,11 @@ export interface ChatMemoryRouterDeps {
   getStorage: () => StorageAdapter | undefined;
   getMetadataService?: (instanceId: string) => Promise<MetadataService>;
   logger: Logger;
+  /**
+   * `multiUser.enabled`（由 v2Deps 透传，见 dispatchV2Request 的
+   * depsWithIsolation）。user 寻址模式（user_ids）仅在该模式开启时可用。
+   */
+  multiUserEnabled?: boolean;
 }
 
 function formatZodErr(err: ZodError): string {
@@ -218,6 +267,57 @@ export async function clearChatMemoryContent(args: {
   };
 }
 
+/**
+ * 清空一个 user 在 multiUser subsume 布局下的全部内容（两代数据）：
+ *
+ *   1. user 自己的 scope（team={uid}）：L0/L1（team+user 收窄）+ 其 per-user
+ *      persona 的行（profiles 按 team+agent）与文件（clearProfileStorage）。
+ *   2. 共享时代扫尾（team="default"，仅当 uid ≠ "default"）：L0/L1 按
+ *      user 收窄、**跳过 profile 删除**（wipeProfiles=false）——profiles 是
+ *      team+agent 粒度，删了会把所有用户的共享 persona 一并误删。
+ *
+ * uid="default"（匿名/共享桶本身）时两代重合，退化为单次全清。
+ *
+ * 失败向上抛，由调用方决定重试（见 clearChatMemoryContentForUserWithRetry）。
+ */
+async function clearChatMemoryContentForUser(args: {
+  store: IMemoryStore;
+  storage: StorageAdapter;
+  userId: string;
+  agentId: string;
+}): Promise<{ l0Deleted: number; l1Deleted: number; profileDeleted: number }> {
+  const userId = (args.userId ?? "").trim();
+  const agentId = (args.agentId ?? "").trim();
+  if (!userId || !agentId) {
+    throw new Error("clearChatMemoryContentForUser requires non-empty userId and agentId");
+  }
+  if (typeof args.store.clearMemoryContent !== "function") {
+    throw new Error("store does not support clearMemoryContent");
+  }
+
+  const teamIds = userId === LEGACY_TEAM_ID ? [userId] : [userId, LEGACY_TEAM_ID];
+  let l0Deleted = 0;
+  let l1Deleted = 0;
+  let profileDeleted = 0;
+  for (const teamId of teamIds) {
+    const ownScope = teamId === userId;
+    const result: MemoryContentClearResult = await args.store.clearMemoryContent({
+      teamId,
+      agentId,
+      userId,
+      // 只有 user 自己的 scope 才动 profile；共享时代扫尾绝不动共享 persona。
+      wipeProfiles: ownScope,
+    });
+    l0Deleted += result.l0Deleted;
+    l1Deleted += result.l1Deleted;
+    profileDeleted += result.profilesDeleted;
+    if (ownScope) {
+      profileDeleted += await clearProfileStorage(args.storage, teamId, agentId);
+    }
+  }
+  return { l0Deleted, l1Deleted, profileDeleted };
+}
+
 /** 清空内容的整体重试次数上限（含首次尝试）。 */
 export const CLEAR_MAX_ATTEMPTS = 3;
 /** 重试退避基数（毫秒），实际等待为 BASE * 2^(n-1)。 */
@@ -234,6 +334,7 @@ function isNonRetryableClearError(err: unknown): boolean {
   return (
     // 入参为空 —— 调用方 bug，重试无意义
     msg.includes("requires non-empty teamId and agentId")
+    || msg.includes("requires non-empty userId and agentId")
     || msg.includes("requires a non-empty sessionId")
     // store 能力缺失 —— 配置问题
     || msg.includes("does not support clearMemoryContent")
@@ -245,7 +346,7 @@ function isNonRetryableClearError(err: unknown): boolean {
 }
 
 /**
- * 带整体重试的内容清空。
+ * 带整体重试的通用执行器。
  *
  * 为什么在**这一层**重试，而不是只依赖 TcvdbClient 的单请求重试：
  * 单请求重试只能覆盖"某一次 HTTP 调用抖动"，但清空是 L0→L1→profiles→存储
@@ -254,27 +355,14 @@ function isNonRetryableClearError(err: unknown): boolean {
  *
  * 失败时抛出最后一次的错误，并在 message 前缀标注尝试次数，便于排查。
  */
-async function clearChatMemoryContentWithRetry(args: {
-  store: IMemoryStore;
-  storage: StorageAdapter;
-  teamId: string;
-  agentId: string;
-  logger: Logger;
-  memoryId: string;
-}): Promise<{
-  result: { l0Deleted: number; l1Deleted: number; profileDeleted: number };
-  attempts: number;
-}> {
+async function withClearRetry<T>(
+  args: { logger: Logger; memoryId: string; op: () => Promise<T> },
+): Promise<{ result: T; attempts: number }> {
   let lastErr: unknown;
 
   for (let attempt = 1; attempt <= CLEAR_MAX_ATTEMPTS; attempt++) {
     try {
-      const result = await clearChatMemoryContent({
-        store: args.store,
-        storage: args.storage,
-        teamId: args.teamId,
-        agentId: args.agentId,
-      });
+      const result = await args.op();
       if (attempt > 1) {
         args.logger.info(
           `${TAG} clear succeeded on attempt ${attempt}/${CLEAR_MAX_ATTEMPTS} memory=${args.memoryId}`,
@@ -304,6 +392,54 @@ async function clearChatMemoryContentWithRetry(args: {
   }
 
   throw lastErr;
+}
+
+/** (team, agent) 资产寻址的带重试清空（mode A）。 */
+async function clearChatMemoryContentWithRetry(args: {
+  store: IMemoryStore;
+  storage: StorageAdapter;
+  teamId: string;
+  agentId: string;
+  logger: Logger;
+  memoryId: string;
+}): Promise<{
+  result: { l0Deleted: number; l1Deleted: number; profileDeleted: number };
+  attempts: number;
+}> {
+  return withClearRetry({
+    logger: args.logger,
+    memoryId: args.memoryId,
+    op: () => clearChatMemoryContent({
+      store: args.store,
+      storage: args.storage,
+      teamId: args.teamId,
+      agentId: args.agentId,
+    }),
+  });
+}
+
+/** user 寻址的带重试清空（mode B）。 */
+async function clearChatMemoryContentForUserWithRetry(args: {
+  store: IMemoryStore;
+  storage: StorageAdapter;
+  userId: string;
+  agentId: string;
+  logger: Logger;
+  memoryId: string;
+}): Promise<{
+  result: { l0Deleted: number; l1Deleted: number; profileDeleted: number };
+  attempts: number;
+}> {
+  return withClearRetry({
+    logger: args.logger,
+    memoryId: args.memoryId,
+    op: () => clearChatMemoryContentForUser({
+      store: args.store,
+      storage: args.storage,
+      userId: args.userId,
+      agentId: args.agentId,
+    }),
+  });
 }
 
 /**
@@ -371,9 +507,18 @@ async function handleChatMemoryClear(
   depsRaw: unknown,
 ): Promise<ApiResponseEnvelope> {
   const deps = depsRaw as ChatMemoryRouterDeps;
-  const parsed = chatMemoryClearRequestSchema.safeParse(body);
-  if (!parsed.success) return errorEnvelope(400, formatZodErr(parsed.error), requestId);
-  const { memory_ids } = parsed.data;
+
+  // ── 寻址模式分流：zod object 会剥未知键，union 解析 {memory_ids, user_ids}
+  //    双字段请求会静默落进资产模式 —— 互斥必须在 schema 之前显式判定。
+  const raw = (body && typeof body === "object" ? body : null) as Record<string, unknown>;
+  const hasMemoryIds = raw !== null && "memory_ids" in raw && raw.memory_ids !== undefined;
+  const hasUserIds = raw !== null && "user_ids" in raw && raw.user_ids !== undefined;
+  if (hasMemoryIds && hasUserIds) {
+    return errorEnvelope(400, "provide either memory_ids or user_ids, not both", requestId);
+  }
+  if (!hasMemoryIds && !hasUserIds) {
+    return errorEnvelope(400, "missing memory_ids or user_ids", requestId);
+  }
 
   const store = deps.getStore();
   if (!store) return errorEnvelope(503, "Store not available", requestId);
@@ -382,6 +527,105 @@ async function handleChatMemoryClear(
   }
   const storage = deps.getStorage();
   if (!storage) return errorEnvelope(503, "Storage not available", requestId);
+
+  // ── user 寻址模式（multiUser 部署）：不经过 metadata 面与资产。 ──
+  if (hasUserIds) {
+    const parsedUsers = chatMemoryUserClearRequestSchema.safeParse(body);
+    if (!parsedUsers.success) return errorEnvelope(400, formatZodErr(parsedUsers.error), requestId);
+
+    if (!deps.multiUserEnabled) {
+      return errorEnvelope(
+        400,
+        "user_ids addressing requires multiUser.enabled; use memory_ids (asset addressing) instead",
+        requestId,
+      );
+    }
+
+    // user_id 值域 fail-closed（与 v3 数据面 dispatch 同一契约：报字段不报值）。
+    // 归一（trim/lowercase）后再去重："Alice" 与 "alice" 是同一 user。
+    const normalized: string[] = [];
+    for (const candidate of parsedUsers.data.user_ids) {
+      const uid = normalizeUserId(candidate);
+      if (uid === null) {
+        return errorEnvelope(
+          400,
+          "Invalid user_id: must be 1-64 chars of [a-z0-9_-] after trim/lowercase normalization (value not echoed)",
+          requestId,
+        );
+      }
+      if (!normalized.includes(uid)) normalized.push(uid);
+    }
+    const agentId = parsedUsers.data.agent_id;
+
+    const items: ChatMemoryClearItem[] = [];
+    for (const uid of normalized) {
+      // 与真实资产 id 同构的确定性伪 id：若未来为该 user 配置了真实实体/资产，
+      // 两侧 id 完全一致；审计两种模式同形。
+      const pseudoAssetId = buildChatMemoryAssetId(uid, agentId);
+      // 部分失败语义（评审轮 3 明示）：重试包住整个两代清除。若自有 scope
+      // 已清成、共享时代扫尾终败，item 报 cleared:false + 全零计数，且不发
+      // 审计（audit 仅成功后记）——已删的数据不回滚、计数不折算。方向是
+      // fail-loud + 幂等重试（重跑清 0 行、audit 落在成功那次），与资产模式
+      // 同构；代价是终败响应会低估实际已删量，靠 error 日志（含 user/agent）
+      // 与重试收敛。如需逐代计数/审计，须拆两次独立重试（P2 候选）。
+      try {
+        const { result, attempts } = await clearChatMemoryContentForUserWithRetry({
+          store,
+          storage,
+          userId: uid,
+          agentId,
+          logger: deps.logger,
+          memoryId: pseudoAssetId,
+        });
+
+        await recordClearAudit(store, {
+          memoryId: pseudoAssetId,
+          teamId: uid,
+          agentId,
+          requestId,
+          logger: deps.logger,
+        });
+
+        items.push({
+          memory_id: pseudoAssetId,
+          cleared: true,
+          l0_deleted: result.l0Deleted,
+          l1_deleted: result.l1Deleted,
+          profile_deleted: result.profileDeleted,
+          ...(attempts > 1 ? { attempts } : {}),
+        });
+      } catch (err) {
+        const retryable = !isNonRetryableClearError(err);
+        deps.logger.error(
+          `${TAG} clear failed memory=${pseudoAssetId} user=${uid} agent=${agentId} ` +
+          `retryable=${retryable}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        items.push({
+          memory_id: pseudoAssetId,
+          cleared: false,
+          l0_deleted: 0,
+          l1_deleted: 0,
+          profile_deleted: 0,
+          reason: retryable
+            ? `clear failed after ${CLEAR_MAX_ATTEMPTS} attempts, please retry later`
+            : "clear rejected due to invalid request or server configuration",
+          retryable,
+          attempts: retryable ? CLEAR_MAX_ATTEMPTS : 1,
+        });
+      }
+    }
+
+    return successEnvelope<ChatMemoryClearData>(
+      { items, all_cleared: items.every((i) => i.cleared) },
+      requestId,
+    );
+  }
+
+  // ── 资产寻址模式（面板/service 部署，原行为） ──
+  const parsed = chatMemoryClearRequestSchema.safeParse(body);
+  if (!parsed.success) return errorEnvelope(400, formatZodErr(parsed.error), requestId);
+  const { memory_ids } = parsed.data;
+
   if (!deps.getMetadataService) {
     return errorEnvelope(503, "Metadata service not available", requestId);
   }

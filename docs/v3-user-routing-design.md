@@ -1,8 +1,8 @@
 # v3 面按 user 路由 — 设计文档
 
-状态：设计稿 **v3.1（已拍板，P0 已实施并过评审轮 2）** · 2026-09-23 · 基线分支 `port/multi-user-stores` @ 6194392
+状态：设计稿 **v3.2（已拍板；P0 过评审轮 2；P1 clear 链落地并过评审轮 3，附录 D）** · 2026-09-24 · 基线分支 `port/multi-user-stores`
 前置：[PORT-NOTES.md](../PORT-NOTES.md)「Out of scope」第 1 条
-修订史：v2 = 评审轮 1 修正（附录 A）；v3 = 四项决策拍板 + 实施前验证推翻两处机制假设（§2.1、附录 B）；v3.1 = 评审轮 2 修正（clear 链表述纠正、delete 剥离类、资产登记跳过、dispatch 钉测、附录 C）
+修订史：v2 = 评审轮 1 修正（附录 A）；v3 = 四项决策拍板 + 实施前验证推翻两处机制假设（§2.1、附录 B）；v3.1 = 评审轮 2 修正（clear 链表述纠正、delete 剥离类、资产登记跳过、dispatch 钉测、附录 C）；v3.2 = P1 clear 链落地（user 寻址 + wipeProfiles 旗标，附录 D）+ 评审轮 3 修正（mongo profile 滤镜、契约用例、部分失败语义，附录 D 补记）
 
 ---
 
@@ -129,7 +129,12 @@ multiUser:
 **(c) 旁路消费者（P1）**
 
 - `auto-recall.ts:163-175`：v1/standalone 面独立构造 scope，`:166` 硬编码 `{teamId:"default", agentId:"default"}` 回退。修法：v1 dispatch（multiUser 时）传入 `{teamId: uid}` 作 `profileIsolation`，保留 default 回退服务 legacy standalone。**已拍板：修。**
-- `clearMemoryContent`（`memory-store.ts:2016-2020`）：**store 层原语在 subsume 下已按人收窄**（per-user 行的 team 列即 user，`team_id={uid}` 滤镜天然按人）；但**管理面 clear 链端到端断裂（评审轮 2 发现）**：`/v3/chat-memory/clear` 的清除目标从资产记录解析（`chat-memory-handlers.ts:406-414`），而 subsume 下不存在任何 per-user 资产（ensure 被跳过/必败）→ clear 面够不到割接后的 per-user 数据，却返回 `cleared: true`——隐私语义上是"擦除我的记忆"静默 no-op。**per-user 资产登记 + clear 链列入 P1**（届时决定 per-user 资产形状，ensure 跳过逻辑随之调整）；P0 期间以本文档为界：清 per-user 数据走 `team_id={uid}` 的 store 级操作，不走 chat-memory 管理面。
+- `clearMemoryContent`（`memory-store.ts:2016-2020`）：**已修（P1 落地，2026-09-24，附录 D）**。定案的 per-user 资产形状是**不建 per-user 元数据实体**：standalone multiUser 部署的 metadata 库是空的（上游自己的 placeholder 登记（team="default", agent="default"）在那里也只会 `agent_not_found`——资产/面板链本是 service 部署专属），为每个自然人建 user+team+agent 实体需要合成 owner（user_key 物料）、吃 team 配额、且把 team（组织语义）错配给人。取而代之，`/v3/chat-memory/clear` 增加 **user 寻址模式**（与 `memory_ids` 资产寻址互斥，同请求双字段 → 400，zod object 会剥未知键故互斥须在 schema 前显式判定）：
+  - 请求 `{user_ids: string[] (≤100, trim/去重), agent_id? (缺省 "default")}`，仅 `multiUser.enabled` 下可用（否则 400）；user_id 经 `normalizeUserId` fail-closed（非法 400 报字段不报值，整批拒绝零清空），归一后去重（"Alice"/"alice" 同人）。不经过 metadata 面与资产（user 模式不要求 metadata service 可用）。
+  - 每个 uid 覆盖**两代数据**：① 自有 scope（`team={uid}`）全清——L0/L1（team+user 收窄）+ per-user persona 的行与文件（`clearProfileStorage`）；② 共享时代扫尾（`team="default"` 行按 user 收窄）**跳过 profile 删除**（新 store 旗标 `wipeProfiles:false`——profiles 是 team+agent 粒度，按 user 收窄的清除若带 profile 删除会误删整个共享 persona；tcvdb/mongo 生效，sqlite 本就不在 clearMemoryContent 动 profile）。`uid="default"` 时两代重合退化为单次全清。
+  - memory_id 返回确定性伪 id `chat_memory-{uid}-{agent}`（与真实资产 id 同构：未来若配真实实体两侧一致），审计两模式同形（L1/L2/L3 各一条）。
+  - **部分失败语义（评审轮 3 明示）**：重试包住整个两代清除——自有 scope 已清成而共享扫尾终败时，item 报 `cleared:false` + 全零计数且不发审计（fail-loud + 幂等重试，audit 落在成功那次；详见附录 D 补记）。
+  - **残余（明示）**：共享时代 persona（`team:default|agent:default`）是跨用户共享物，per-user clear 不（也无法）摘除单人贡献；割接后它本就不可见（scope 已换），回填脚本 + 冷启动再生是正解。P0 的 ensure 跳过守卫保留不变（依旧不登记 per-user 资产）。
 
 **(d) 配置穿线**
 
@@ -160,7 +165,7 @@ dispatch 在 gateway 进程内，`V2RouterDeps` 加一个 `multiUserEnabled: boo
 | P0→B′ 过渡 | **同形免迁移**：P0（dispatch 归一）写出的就是 `team:{uid}\|agent:{a}`，B′ 完整版（+写拒绝/auto-recall）落在同一形状上——不存在第二次冷启动（原 B 的 3 段语法才有此问题） |
 | 跨代混合会话 | L1 分组的 teamId 取自组内首行（时间序最早）的列（`pipeline-factory.ts:540`）：割切前开始的旧会话若含旧行（`team="default"`），其后续新消息仍归入共享 scope——**旧会长线程不享受 per-user persona**。缓解（可选 ops 步骤，非 P0 依赖）：一次性回填脚本 `team_id="default" → user_id`（L0/L1，user_id≠"default" 的行），使混合列归一。已拍板"接受 P0→B 数据迁移"精神下，此脚本列为 P1 交付 |
 | `V3_STRICT_ISOLATION` | 正交可叠加（B′ 下三元组仍齐全——插件照发 team_id，归一在服务端） |
-| chat-memory 管理面 clear | **P0 已知行为**：subsume 下无 per-user 资产，`/v3/chat-memory/clear` 对割切后 per-user 数据是静默 no-op（返回 `cleared: true`）；per-user clear 链 P1（§4.2(c)） |
+| chat-memory 管理面 clear | **已修（P1，2026-09-24）**：`/v3/chat-memory/clear` 新增 user 寻址模式（`{user_ids}`，multiUser 门控，两代扫除 + `wipeProfiles` 旗标），per-user 清空端到端可用（§4.2(c)）；`memory_ids` 资产寻址原样保留（面板/service 部署） |
 
 回滚：`multiUser.enabled=false` 即回上游行为，无数据破坏。
 
@@ -171,6 +176,7 @@ dispatch 在 gateway 进程内，`V2RouterDeps` 加一个 `multiUserEnabled: boo
 1. **单元（vitest，`src/gateway/__tests__/multi-user.test.ts`，P0 已落地）**
    - 纯函数 `applyMultiUserV3Routing` 矩阵：写端点 subsume（placeholder/缺席 team、真实 team 优先、`subsumedTeam` 标记）、user 维度端点剥离（读 6 + 删 2 全子路径）、归一化（大小写/ASCII trim/非法 400）、`user_id=default` 占位时行为不变（fail-open 兼容）；
    - **dispatch 级（`handleV2Route` 直调 + fake L0 store，P0 已落地）**：subsume 下 `/v3/conversation/add` 落库行 `team_id=user_id={uid}` + 资产登记跳过；flag off 时行为逐比特不变（team 保持 "default"、资产正常登记）；真实 team 优先 + 资产正常登记；`/v3/conversation/query` 滤镜无 team 维度、双代行同可见（total=2）；非法 user_id 400（错误体不含原值、零写入、零登记）。
+   - **chat-memory clear dispatch 级（P1 已落地，`handleV2Route` + `makeChatMemoryRouteTable` 直调 + fake clear store/storage）**：user 模式两代调用形状（自有 scope `wipeProfiles:true` + 扫尾 `team="default"` `wipeProfiles:false`，顺序钉死）；profile 文件只删 user 自己的 scope 前缀；计数合并；审计伪 id 同形（L1/L2/L3）；`uid="default"` 单次全清退化；归一/去重/自定义 agent_id；multiUser off → 400；非法 user_id → 400 不回显值且零清空；双模式同请求 → 400 / 双缺席 → 400；资产模式回归（multiUser on/off 均走 metadata 解析不受影响）。
 2. **集成**：v3 数据面双用户回归——alice/bob 各自 conversation/add → 查询互不可见 → core_read 各自 scope（fake store 级）。
 3. **e2e（`gateway.multi-user.e2e.test.ts` 扩展，P1）**：注意该文件现状是 **v1 物理 core 面**（/capture、/search/*、/seed），零 v3 断言且被 vitest 默认排除——P1 扩展：真实网关 + mock LLM，双用户 v3 数据面写 → L1 提取 → **L2 任务键 `profile:team:{uid}|agent:default` 落位断言**（这是 §2.1 接缝 1 的端到端证明）→ core_read 各自 persona。
 4. **pytest（插件侧）**：现有 `test_multi_user_identity.py` 全绿不动（插件零改动，应原样通过）。
@@ -180,7 +186,7 @@ dispatch 在 gateway 进程内，`V2RouterDeps` 加一个 `multiUserEnabled: boo
 ## 7. 实施排期（已拍板后修正）
 
 - **P0（本次，网关侧）**：§4.2(a) dispatch 归一（subsume + user 维度端点剥离[含按 id 删] + 归一化 400 + `subsumedTeam` 资产登记跳过）+ server deps 接线 + §6.1 单测（纯函数矩阵 + dispatch 级钉测）。**前置条件（已拍板确认）**：`V3_STRICT_ISOLATION` 保持 off（归一后其实可开，但 P0 不改部署面）；接受共享 persona 一次冷启动；~~P0→B 数据迁移~~（同形免迁移，条件自动满足）。
-- **P1**：§4.2(b) default 桶写拒绝 + §4.2(c) auto-recall 穿线 + 跨代混合会话回填脚本 + §6.2-6.3 集成/e2e。
+- **P1**：§4.2(b) default 桶写拒绝 + §4.2(c) auto-recall 穿线 + 跨代混合会话回填脚本 + §6.2-6.3 集成/e2e。**clear 链已先行落地（2026-09-24，附录 D）**。
 - **P2**：文档转正 + pytest 钉测复核。
 - **P3（09-29 上游 PR 材料）**：以"per-user routing via team-slot normalization at dispatch"独立 feature 进 PR；B（3 段语法）作为上游反馈时的升级路径备选写入讨论。
 
@@ -221,3 +227,23 @@ dispatch 在 gateway 进程内，`V2RouterDeps` 加一个 `multiUserEnabled: boo
 - **I3 dispatch 钉测缺失**：补齐（见声明纠正 2）。
 - **I4 400 兼容未文档化**：§5 迁移表补"第三方 SDK user_id 值域对齐"行。
 - Minor：§2.1 补 tcvdb/rowfs 作用域注（sqlite 下顶替是"静默不生效"非"饿死"，上游 PR 需先声明）；§4.2(a)-3 补读剥无条件性注；剥离测试补全 8 子路径。
+
+## 附录 D：P1 clear 链落地记录（2026-09-24）
+
+per-user 资产形状定案：**不建实体，clear 面加 user 寻址**（§4.2(c)）。实施面：
+
+- store 契约 `MemoryContentClearFilter.wipeProfiles?: boolean`（缺省 true 逐比特兼容；tcvdb `memory-store.ts:2030s`/mongo `:737s` 跳过 profile 删除，sqlite 本就恒 0 天然兼容）；
+- `chat-memory-handlers.ts`：`chatMemoryUserClearRequestSchema` + 模式分流（互斥在 schema 前显式判定——zod object 剥未知键，union 会让双字段请求静默落进资产模式）+ `clearChatMemoryContentForUser`（两代扫除）+ 重试泛化（`withClearRetry`，`isNonRetryableClearError` 补新错误串）+ `ChatMemoryRouterDeps.multiUserEnabled`（经 `depsWithIsolation` 从 v2Deps 自动透传，server.ts 零改动）；
+- 伪 id `buildChatMemoryAssetId(uid, agent)`（复用 metadata/utils 同一构造器，审计/响应与真实资产 id 同形）；
+- dispatch 级钉测 6 条（§6.1-3），multi-user 套件 33/33 绿。
+
+决策要点存档：评审轮 2 曾把"每用户一个资产 → 管理面污染"列为担忧，实施时验证发现 standalone 下登记根本走不到那一步（metadata 空 → `agent_not_found`），真正的问题面是**资产寻址在 multiUser 部署无实体可解析**——所以修复不在这侧补实体（会引入合成 owner/key 物料/配额/team 语义错配四重新债），而在 clear 面补**与部署模型匹配的寻址维度**。user 寻址与资产寻址互斥并存：service/面板部署继续走资产，standalone multiUser 走 user。
+
+### 附录 D 补记：评审轮 3 修正（2026-09-24，提交前）
+
+独立 subagent 评审（列级追踪 + 重跑 48/48）：**1 Critical / 2 Important / 4 Minor**，已全部处置：
+
+- **C1（已修）**：mongo `clearMemoryContent` 曾用同一个带 `user_id` 的 match 删 L0/L1/profiles 三表——per-user persona 是混合列 population（网关直写行带 `user_id`，管线行经 scope 解析 `user_id=""`），按 user 收窄的 profile 删除会漏掉管线行，mongo 行又内联 content → user 模式在 mongo 是"报 `cleared:true` 的部分静默擦除"。修复：profile 改独立 `profileMatch = {team_id, agent_id}`（与 tcvdb 契约对齐；自有 scope 调用下 team 槽位即 user，粒度足够）。
+- **I2（已补，休眠态如实标注）**：per-user 清空契约用例加入 `__contract__/memory-store.contract.ts`（两形状钉死：扫尾 `userId+wipeProfiles:false` profile 零删；自有 scope `userId` 缺省全删含 `user_id=""` 管线行 + 旁观 team 不动）。**注**：本分支无任何后端 spec 消费该契约套件（全树仅 3 个 test 文件）——该用例此刻不被执行，待后端 harness 接线（上游 CI）后生效；mongo 修复的本地验证以 tcvdb 参照镜像 + 类型检查 + 全量套件为凭。
+- **I3（已文档化）**：部分失败语义明示（代码注释 + 本节）：重试包住整个两代清除，自有 scope 已清成而共享扫尾终败时，item 报 `cleared:false` + 全零计数且不发审计——fail-loud + 幂等重试（audit 落在成功那次），终败响应低估已删量，靠 error 日志与重试收敛；逐代计数/审计列 P2 候选。
+- Minor：门控与解析先后（先 zod 后 multiUser 门，均为 400，不改）；user 模式 `agent_id` 仅 trim 不做值域（管理面凭据信任级，记一笔）；文档"profiles 按 team+agent"表述随 C1 修复后两后端皆成立。

@@ -2029,7 +2029,11 @@ export class TcvdbMemoryStore implements IMemoryStore {
 
     const l0Deleted = await this.client.deleteDoc(this.l0Collection, { query: { filter: contentFilter } });
     const l1Deleted = await this.client.deleteDoc(this.l1Collection, { query: { filter: contentFilter } });
-    const profilesDeleted = await this.client.deleteDoc(this.profilesCollection, { query: { filter: profileFilter } });
+    // wipeProfiles=false：per-user 清空扫共享时代（team=default）行时必须跳过
+    // profile 删除——profileFilter 无 user 维度，删了就是整个共享 persona。
+    const profilesDeleted = filter.wipeProfiles === false
+      ? 0
+      : await this.client.deleteDoc(this.profilesCollection, { query: { filter: profileFilter } });
 
     return { l0Deleted, l1Deleted, profilesDeleted };
   }

@@ -729,6 +729,13 @@ export class MongoMemoryStore implements IMemoryStore {
     }
     const match: Record<string, string> = { team_id: filter.teamId, agent_id: filter.agentId };
     if (filter.userId !== undefined) match.user_id = filter.userId;
+    // profiles 是 team+agent 粒度（与 tcvdb 的 profileFilter 对齐，见其
+    // clearMemoryContent 注释）：per-user persona 是混合列 population——网关
+    // 直写行带 user_id，管线（scope 解析回 {teamId}）生成的行 user_id=""。
+    // 按 user 收窄 profile 删除会漏掉管线行，留下"清了却没清干净"的
+    // persona 正文（mongo 行内联 content）。team 槽位在 user 模式下就是
+    // user 本身，team+agent 已足够按人。
+    const profileMatch: Record<string, string> = { team_id: filter.teamId, agent_id: filter.agentId };
 
     const l0 = await this.coll(COLLECTIONS.L0);
     const l1 = await this.coll(COLLECTIONS.L1);
@@ -737,7 +744,11 @@ export class MongoMemoryStore implements IMemoryStore {
     const [l0Res, l1Res, profRes] = await Promise.all([
       l0.deleteMany(match as never),
       l1.deleteMany(match as never),
-      profiles.deleteMany(match as never),
+      // wipeProfiles=false：per-user 清空扫共享时代（team=default）行时跳过
+      // profile 删除（profiles 是 team+agent 粒度，删了就是整个共享 persona）。
+      filter.wipeProfiles === false
+        ? Promise.resolve({ deletedCount: 0 })
+        : profiles.deleteMany(profileMatch as never),
     ]);
     return {
       l0Deleted: l0Res.deletedCount,

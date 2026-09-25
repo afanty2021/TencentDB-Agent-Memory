@@ -10,6 +10,9 @@ import { loadGatewayConfig } from "../config.js";
 import type { GatewayConfig } from "../config.js";
 import { TdaiGateway } from "../server.js";
 import { applyMultiUserV3Routing, type V3IsolationCtx } from "../v2-router.js";
+import { handleV2Route } from "../v2-router.js";
+import { makeChatMemoryRouteTable } from "../chat-memory-handlers.js";
+import { StorageAdapter } from "../../core/storage/adapter.js";
 
 // ============================
 // Isolated test environment
@@ -520,8 +523,6 @@ describe("applyMultiUserV3Routing (v3 data-plane per-user ctx rewrite)", () => {
 // file covers the v1 physical-core surface only — these are the only tests
 // standing guard over the /v3 multiUser routing as of P0.
 
-import { handleV2Route } from "../v2-router.js";
-
 interface FakeL0Row {
   record_id: string; session_id: string; session_key: string;
   team_id: string; user_id: string; agent_id: string; task_id: string;
@@ -673,5 +674,196 @@ describe("v3 dispatch wiring (multiUser subsume at handleV2Route level)", () => 
     expect(r.body.message).not.toContain("wendy.li");
     expect(store.rows).toHaveLength(0);
     expect(r.assetRegistrations).toBe(0);
+  });
+});
+
+// ============================
+// /v3/chat-memory/clear user-scope mode (P1 per-user clear chain, §4.2(c))
+// ============================
+// Dispatch-level pins for the user_ids addressing mode: both-generation store
+// call shapes (own scope wipes profiles, legacy sweep never does), profile
+// file deletion scoped to the user's own prefix, gating on multiUser.enabled,
+// and the fail-closed 400 contract. The asset mode (memory_ids) is pinned for
+// regressions only — its full behavior is upstream's.
+
+interface ClearCall { teamId: string; agentId: string; userId?: string; wipeProfiles?: boolean }
+
+function fakeClearStore() {
+  const clearCalls: ClearCall[] = [];
+  const audits: Array<{ record_id: string; layer: string; team_id: string }> = [];
+  return {
+    clearCalls,
+    audits,
+    clearMemoryContent: async (filter: ClearCall) => {
+      clearCalls.push({ ...filter });
+      // Real stores: profilesDeleted only on the profile-wiping call.
+      return { l0Deleted: 1, l1Deleted: 2, profilesDeleted: filter.wipeProfiles === false ? 0 : 3 };
+    },
+    appendAudit: async (entry: { record_id: string; layer: string; team_id: string }) => {
+      audits.push({ record_id: entry.record_id, layer: entry.layer, team_id: entry.team_id });
+    },
+  };
+}
+
+/** Minimal local-style backend: lists 2 objects under any prefix, records deletions. */
+function fakeProfileStorage() {
+  const deletedPrefixes: string[] = [];
+  const backend = {
+    type: "local" as const,
+    listObjects: async (prefix: string) => ({
+      entries: [
+        { key: `${prefix}persona.md`, isDirectory: false },
+        { key: `${prefix}scene_blocks/a.md`, isDirectory: false },
+      ],
+    }),
+    deleteByPrefix: async (prefix: string) => {
+      deletedPrefixes.push(prefix);
+      return 2;
+    },
+  };
+  return { storage: new StorageAdapter(backend as never), deletedPrefixes };
+}
+
+async function dispatchChatMemoryClear(
+  body: unknown,
+  opts: {
+    multiUser?: boolean;
+    store?: ReturnType<typeof fakeClearStore>;
+    storage?: ReturnType<typeof fakeProfileStorage>;
+    resolveTargets?: Array<{ asset_id: string; team_id: string; agent_id: string }>;
+  } = {},
+): Promise<{ status: number; body: { code?: number; message?: string; data?: Record<string, unknown> } }> {
+  const sent: Array<{ status: number; body: unknown }> = [];
+  const deps = {
+    getStore: () => opts.store ?? fakeClearStore(),
+    getEmbedding: () => undefined,
+    getStorage: () => (opts.storage ?? fakeProfileStorage()).storage,
+    logger: { info: () => {}, warn: () => {}, debug: () => {}, error: () => {} },
+    ...(opts.multiUser ? { multiUserEnabled: true } : {}),
+    getMetadataService: async () => ({
+      resolveChatMemoryTargets: async () => opts.resolveTargets ?? [],
+    }),
+  } as Parameters<typeof handleV2Route>[6];
+  const req = {
+    url: "/v3/chat-memory/clear",
+    headers: { authorization: "Bearer test-key", "x-tdai-service-id": "test-svc" },
+  } as unknown as Parameters<typeof handleV2Route>[0];
+  const res = {} as unknown as Parameters<typeof handleV2Route>[1];
+  const handled = await handleV2Route(
+    req, res, "/v3/chat-memory/clear", "POST",
+    async () => body,
+    (_res, status, payload) => { sent.push({ status, body: payload }); },
+    deps,
+    makeChatMemoryRouteTable() as never,
+  );
+  expect(handled).toBe(true);
+  const last = sent[sent.length - 1] as { status: number; body: { code?: number; message?: string; data?: Record<string, unknown> } };
+  return { status: last.status, body: last.body };
+}
+
+describe("/v3/chat-memory/clear user-scope mode (multiUser)", () => {
+  it("clears both generations: own scope wipes profiles, legacy sweep never does", async () => {
+    const store = fakeClearStore();
+    const ps = fakeProfileStorage();
+    const r = await dispatchChatMemoryClear(
+      { user_ids: ["alice"] },
+      { multiUser: true, store, storage: ps },
+    );
+    expect(r.status).toBe(200);
+    // 两代调用形状（顺序：先自有 scope，后共享时代扫尾）
+    expect(store.clearCalls).toEqual([
+      { teamId: "alice", agentId: "default", userId: "alice", wipeProfiles: true },
+      { teamId: "default", agentId: "default", userId: "alice", wipeProfiles: false },
+    ]);
+    // profile 文件只删 user 自己的 scope 前缀（共享 persona 不动）
+    const scopePrefix = `profiles/${encodeURIComponent("team:alice|agent:default")}/`;
+    expect(ps.deletedPrefixes).toEqual([scopePrefix]);
+    // 计数合并：l0=1+1, l1=2+2, profiles=3(行)+2(文件)+0(扫尾跳过)
+    const items = (r.body.data?.items as Array<Record<string, unknown>>);
+    expect(items).toHaveLength(1);
+    expect(items[0].memory_id).toBe("chat_memory-alice-default");
+    expect(items[0].cleared).toBe(true);
+    expect(items[0].l0_deleted).toBe(2);
+    expect(items[0].l1_deleted).toBe(4);
+    expect(items[0].profile_deleted).toBe(5);
+    expect(r.body.data?.all_cleared).toBe(true);
+    // 审计与真实资产 id 同形，L1/L2/L3 各一条
+    expect(store.audits.map((a) => a.layer).sort()).toEqual(["L1", "L2", "L3"]);
+    expect(store.audits.every((a) => a.record_id === "chat_memory-alice-default")).toBe(true);
+  });
+
+  it("collapses to a single full wipe for the anonymous/default user", async () => {
+    const store = fakeClearStore();
+    const ps = fakeProfileStorage();
+    const r = await dispatchChatMemoryClear(
+      { user_ids: ["default"] },
+      { multiUser: true, store, storage: ps },
+    );
+    expect(r.status).toBe(200);
+    expect(store.clearCalls).toEqual([
+      { teamId: "default", agentId: "default", userId: "default", wipeProfiles: true },
+    ]);
+    expect(ps.deletedPrefixes).toEqual([`profiles/${encodeURIComponent("team:default|agent:default")}/`]);
+  });
+
+  it("normalizes, dedupes and trims user_ids; honors a custom agent_id", async () => {
+    const store = fakeClearStore();
+    const r = await dispatchChatMemoryClear(
+      { user_ids: ["  Alice ", "alice", "bob"], agent_id: " bot-1 " },
+      { multiUser: true, store },
+    );
+    expect(r.status).toBe(200);
+    const items = (r.body.data?.items as Array<Record<string, unknown>>);
+    expect(items.map((i) => i.memory_id)).toEqual([
+      "chat_memory-alice-bot-1",
+      "chat_memory-bob-bot-1",
+    ]);
+    // alice 的两代 + bob 的两代
+    expect(store.clearCalls).toHaveLength(4);
+    expect(store.clearCalls[0]).toEqual({ teamId: "alice", agentId: "bot-1", userId: "alice", wipeProfiles: true });
+  });
+
+  it("rejects user_ids mode with 400 when multiUser is off (asset mode unaffected)", async () => {
+    const r = await dispatchChatMemoryClear({ user_ids: ["alice"] }, { multiUser: false });
+    expect(r.status).toBe(400);
+    expect(r.body.message).toContain("multiUser.enabled");
+
+    // 资产模式不受 multiUser 影响，仍走 metadata 解析
+    const store = fakeClearStore();
+    const a = await dispatchChatMemoryClear(
+      { memory_ids: ["chat_memory-real-team-a1"] },
+      {
+        multiUser: true,
+        store,
+        resolveTargets: [{ asset_id: "chat_memory-real-team-a1", team_id: "real-team", agent_id: "a1" }],
+      },
+    );
+    expect(a.status).toBe(200);
+    expect(store.clearCalls).toEqual([{ teamId: "real-team", agentId: "a1" }]);
+  });
+
+  it("rejects invalid user_id fail-closed without echoing the value", async () => {
+    const store = fakeClearStore();
+    const r = await dispatchChatMemoryClear(
+      { user_ids: ["alice", "wendy.li"] },
+      { multiUser: true, store },
+    );
+    expect(r.status).toBe(400);
+    expect(r.body.message).toContain("user_id");
+    expect(r.body.message).not.toContain("wendy.li");
+    expect(store.clearCalls).toHaveLength(0); // 整批拒绝，一条不清
+  });
+
+  it("rejects ambiguous addressing: both modes, or neither", async () => {
+    const both = await dispatchChatMemoryClear(
+      { memory_ids: ["x"], user_ids: ["alice"] },
+      { multiUser: true },
+    );
+    expect(both.status).toBe(400);
+    expect(both.body.message).toContain("not both");
+
+    const neither = await dispatchChatMemoryClear({}, { multiUser: true });
+    expect(neither.status).toBe(400);
+    expect(neither.body.message).toContain("missing");
   });
 });

@@ -479,6 +479,13 @@ export interface MemoryContentClearFilter {
   agentId: string;
   /** 可选：进一步收窄到单个 user。缺省表示该 agent 下所有 user。 */
   userId?: string;
+  /**
+   * 可选：false 时只清 L0/L1 内容行，**跳过 L2/L3 profile 行**（缺省 true
+   * 保持既有行为）。用于 per-user 清空扫共享时代（team=default）的行——
+   * profiles 是 team+agent 粒度（见 buildProfileIsolationScope），带 user
+   * 收窄的清除若同时删 profile 会误删整个共享 persona。
+   */
+  wipeProfiles?: boolean;
 }
 
 /** 清空结果：各层实际删除行数。 */
