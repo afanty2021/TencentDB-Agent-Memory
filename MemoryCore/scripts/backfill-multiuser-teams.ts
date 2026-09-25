@@ -24,6 +24,11 @@
  *   4. 建议先停网关（或低峰执行）+ 备份 vectors.db（`cp vectors.db
  *      vectors.db.bak-$(date +%s)`）。写门禁开启后新写入不可能再落共享桶。
  *
+ * ⚠️ 目标库路径：v3 数据面（插件流量）按 serviceId 走 store pool 实例路由，
+ * 行落在 `<dataDir>/instances/<serviceId>/vectors.db`（standalone 也是，e2e
+ * 实证）；v1 物理 core 面才落 `<dataDir>/users/<uid>/vectors.db` 或根库。
+ * 回填 v3 数据请把 --db 指到**实例库**（dry-run 的命中数可自行验证指对了库）。
+ *
  * 用法（驱动与 store 同源：Node 内建 node:sqlite，无原生依赖）：
  *   node --import tsx scripts/backfill-multiuser-teams.ts --db <path/to/vectors.db>            # dry-run
  *   node --import tsx scripts/backfill-multiuser-teams.ts --db <path/to/vectors.db> --confirm  # 执行回填

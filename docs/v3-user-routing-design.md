@@ -1,8 +1,8 @@
 # v3 面按 user 路由 — 设计文档
 
-状态：设计稿 **v3.2（已拍板；P0 过评审轮 2；P1 clear 链落地并过评审轮 3，附录 D）** · 2026-09-24 · 基线分支 `port/multi-user-stores`
+状态：**v3.3（P0+P1 全部落地）** · 2026-09-25 · 基线分支 `port/multi-user-stores`
 前置：[PORT-NOTES.md](../PORT-NOTES.md)「Out of scope」第 1 条
-修订史：v2 = 评审轮 1 修正（附录 A）；v3 = 四项决策拍板 + 实施前验证推翻两处机制假设（§2.1、附录 B）；v3.1 = 评审轮 2 修正（clear 链表述纠正、delete 剥离类、资产登记跳过、dispatch 钉测、附录 C）；v3.2 = P1 clear 链落地（user 寻址 + wipeProfiles 旗标，附录 D）+ 评审轮 3 修正（mongo profile 滤镜、契约用例、部分失败语义，附录 D 补记）
+修订史：v2 = 评审轮 1 修正（附录 A）；v3 = 四项决策拍板 + 实施前验证推翻两处机制假设（§2.1、附录 B）；v3.1 = 评审轮 2 修正（clear 链表述纠正、delete 剥离类、资产登记跳过、dispatch 钉测、附录 C）；v3.2 = P1 clear 链落地（user 寻址 + wipeProfiles 旗标，附录 D）+ 评审轮 3 修正（mongo profile 滤镜、契约用例、部分失败语义，附录 D 补记）；v3.3 = P1 收口（写拒绝/auto-recall 穿线/回填脚本/e2e v3 断言全落地；e2e 实证 v3 数据落 instances/{serviceId} 实例库）
 
 ---
 
@@ -178,7 +178,7 @@ dispatch 在 gateway 进程内，`V2RouterDeps` 加一个 `multiUserEnabled: boo
    - **dispatch 级（`handleV2Route` 直调 + fake L0 store，P0 已落地）**：subsume 下 `/v3/conversation/add` 落库行 `team_id=user_id={uid}` + 资产登记跳过；flag off 时行为逐比特不变（team 保持 "default"、资产正常登记）；真实 team 优先 + 资产正常登记；`/v3/conversation/query` 滤镜无 team 维度、双代行同可见（total=2）；非法 user_id 400（错误体不含原值、零写入、零登记）。
    - **chat-memory clear dispatch 级（P1 已落地，`handleV2Route` + `makeChatMemoryRouteTable` 直调 + fake clear store/storage）**：user 模式两代调用形状（自有 scope `wipeProfiles:true` + 扫尾 `team="default"` `wipeProfiles:false`，顺序钉死）；profile 文件只删 user 自己的 scope 前缀；计数合并；审计伪 id 同形（L1/L2/L3）；`uid="default"` 单次全清退化；归一/去重/自定义 agent_id；multiUser off → 400；非法 user_id → 400 不回显值且零清空；双模式同请求 → 400 / 双缺席 → 400；资产模式回归（multiUser on/off 均走 metadata 解析不受影响）。
 2. **集成**：v3 数据面双用户回归——alice/bob 各自 conversation/add → 查询互不可见 → core_read 各自 scope（fake store 级）。
-3. **e2e（`gateway.multi-user.e2e.test.ts` 扩展，P1）**：注意该文件现状是 **v1 物理 core 面**（/capture、/search/*、/seed），零 v3 断言且被 vitest 默认排除——P1 扩展：真实网关 + mock LLM，双用户 v3 数据面写 → L1 提取 → **L2 任务键 `profile:team:{uid}|agent:default` 落位断言**（这是 §2.1 接缝 1 的端到端证明）→ core_read 各自 persona。
+3. **e2e（P1 已落地，2026-09-25）**：`gateway.multi-user.e2e.test.ts` 新增 v3 subsume 场景（真实网关于进程 + HTTP + mock LLM）：写门禁（缺席身份 add → 400 零落库）→ 双用户 v3 写 → **L0/L1 行 `team_id=user_id` 列级断言（真实管线）** → **per-user profile 存储域目录 `profiles/team:{uid}|agent:default/` 落盘断言**（§2.1 接缝 1 的端到端证明；L2 任务键另见子进程 trace）→ `/v3/conversation/search` 双向不可见。运行：`TDAI_E2E_REAL_GATEWAY=1 npx vitest run --config vitest.e2e.config.ts`（新配置解除默认 exclude；afterAll 停子进程偶发超时为存量 flake，P0 轮已基线定性）。**e2e 实证的新事实**：v3 数据面按 serviceId 走 store pool 实例路由，行落 `<dataDir>/instances/<serviceId>/vectors.db`（standalone 也是；v1 物理 core 面才落 `users/<uid>/`）——回填脚本 --db 须指向实例库（脚本头已注明）。
 4. **pytest（插件侧）**：现有 `test_multi_user_identity.py` 全绿不动（插件零改动，应原样通过）。
 
 ---
@@ -186,7 +186,7 @@ dispatch 在 gateway 进程内，`V2RouterDeps` 加一个 `multiUserEnabled: boo
 ## 7. 实施排期（已拍板后修正）
 
 - **P0（本次，网关侧）**：§4.2(a) dispatch 归一（subsume + user 维度端点剥离[含按 id 删] + 归一化 400 + `subsumedTeam` 资产登记跳过）+ server deps 接线 + §6.1 单测（纯函数矩阵 + dispatch 级钉测）。**前置条件（已拍板确认）**：`V3_STRICT_ISOLATION` 保持 off（归一后其实可开，但 P0 不改部署面）；接受共享 persona 一次冷启动；~~P0→B 数据迁移~~（同形免迁移，条件自动满足）。
-- **P1**：§4.2(b) default 桶写拒绝 + §4.2(c) auto-recall 穿线 + 跨代混合会话回填脚本 + §6.2-6.3 集成/e2e。**clear 链已先行落地（2026-09-24，附录 D）**。
+- **P1**：✅ 全部落地（2026-09-25）：§4.2(b) default 桶写拒绝 + §4.2(c) auto-recall/per-user core isolation 穿线（6d17ba9）+ 跨代回填脚本（73f1744，dry-run 默认 + --confirm，自测含幂等/保护行）+ §6.3 e2e v3 断言（含 vitest.e2e.config.ts 接线，86d260e）。clear 链先行落地并过评审轮 3（附录 D）。§6.2 集成面已被 dispatch 级钉测等价覆盖，未单列。
 - **P2**：文档转正 + pytest 钉测复核。
 - **P3（09-29 上游 PR 材料）**：以"per-user routing via team-slot normalization at dispatch"独立 feature 进 PR；B（3 段语法）作为上游反馈时的升级路径备选写入讨论。
 

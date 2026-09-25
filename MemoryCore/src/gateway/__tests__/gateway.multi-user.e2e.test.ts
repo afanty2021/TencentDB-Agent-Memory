@@ -42,6 +42,8 @@ const PORT_MULTI_USER = 18420;
 const PORT_LEGACY = 18421;
 const PORT_AUTH = 18422;
 const PORT_L1_ISOLATION = 18423;
+/** v3-subsume-surface scenario (design §6.3). */
+const PORT_V3_SUBSUME = 18424;
 /** In-test mock OpenAI-compatible LLM server (used by the L1 isolation test). */
 const PORT_MOCK_LLM = 18430;
 
@@ -509,6 +511,48 @@ async function countRows(dbPath: string, table: string, sessionKeys?: string[]):
   throw new Error("could not query node:sqlite (tried plain and --experimental-sqlite)");
 }
 
+/**
+ * Run an arbitrary read-only SQL statement against a SQLite file and parse the
+ * JSON-printed rows (same dual-flag node:sqlite dance as {@link countRows};
+ * a missing table resolves to [] for polling friendliness).
+ */
+async function sqliteQuery<T = Record<string, unknown>>(dbPath: string, sql: string, ...params: string[]): Promise<T[]> {
+  const script = [
+    'const { DatabaseSync } = require("node:sqlite");',
+    'const db = new DatabaseSync(process.argv[1], { readOnly: true });',
+    "const rows = db.prepare(process.argv[2]).all(...process.argv.slice(3));",
+    "console.log(JSON.stringify(rows));",
+  ].join("\n");
+  for (const flags of [[], ["--experimental-sqlite"]]) {
+    const result = await new Promise<{ status: number; stdout: string; stderr: string }>((resolve) => {
+      const child = spawn(process.execPath, [...flags, "-e", script, dbPath, sql, ...params], { stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (c: Buffer) => { stdout += c.toString("utf-8"); });
+      child.stderr.on("data", (c: Buffer) => { stderr += c.toString("utf-8"); });
+      child.on("close", (status) => resolve({ status: status ?? -1, stdout, stderr }));
+    });
+    if (result.status === 0) return JSON.parse(result.stdout) as T[];
+    if (/no such table/i.test(result.stderr)) return [];
+    if (!/node:sqlite|--experimental-sqlite/i.test(result.stderr)) {
+      throw new Error(`sqlite query failed: ${result.stderr.trim()}`);
+    }
+  }
+  throw new Error("could not query node:sqlite (tried plain and --experimental-sqlite)");
+}
+
+/** Poll a sqlite query until `predicate(rows)` passes (200ms cadence). */
+async function pollSqlite<T>(dbPath: string, query: () => Promise<T[]>, predicate: (rows: T[]) => boolean): Promise<T[]> {
+  const deadline = Date.now() + L1_EXTRACTION_TIMEOUT_MS;
+  let last: T[] = [];
+  while (Date.now() < deadline) {
+    last = await query();
+    if (predicate(last)) return last;
+    await sleep(200);
+  }
+  throw new Error(`sqlite predicate not satisfied within ${L1_EXTRACTION_TIMEOUT_MS}ms (last: ${JSON.stringify(last)})`);
+}
+
 // ============================
 // The e2e scenarios
 // ============================
@@ -843,6 +887,131 @@ describe("gateway multi-user e2e (real subprocess + HTTP)", () => {
       const bSeesA = await searchMemories(gw.baseUrl, "raven ledger", "b");
       expect(bSeesA.total).toBe(0);
       expect(bSeesA.results).not.toContain("raven");
+    } finally {
+      await gw.stop();
+      await mock.close();
+    }
+  });
+
+  it("v3 subsume surface: identity-less writes 400, dual-user team columns, per-user L2 task keys, no cross-visibility", async () => {
+    // Design §6.3 (P1): the v3 data-plane proof the v1 scenarios above cannot
+    // give — everything lands in the MAIN store (v3 never touches the
+    // per-user physical cores), so isolation is carried purely by the
+    // subsume-normalized columns:
+    //   - write gate: /v3/conversation/add without user_id → 400 (§4.2(b))
+    //   - L0/L1 rows carry team_id = user_id (subsume columns)
+    //   - after real L1 extraction, the L2 task keys land as
+    //     profile:team:{uid}|agent:default|session:… in the checkpoint —
+    //     the §2.1 seam-1 end-to-end proof (L2 requery parses team:{uid}
+    //     and that column EXISTS on the L1 rows)
+    //   - /v3/conversation/search per user: own tokens visible, the other
+    //     user's L0-only tokens invisible
+    const mock = await startMockLlmServer();
+    const gw = await startGateway({
+      port: PORT_V3_SUBSUME,
+      multiUser: true,
+      extraEnv: {
+        TDAI_LLM_BASE_URL: mock.baseUrl,
+        TDAI_LLM_API_KEY: "test-key",
+        TDAI_LLM_MODEL: "mock",
+      },
+      gatewayConfigFile: {
+        memory: { pipeline: { enableWarmup: false, everyNConversations: 2 } },
+      },
+    });
+    dumpLogsOnFailure(gw);
+
+    // v3 数据面按 serviceId 走 store pool 实例路由（standalone 也是）：
+    // L0/L1 行落在 dataDir/instances/{serviceId}/vectors.db，主库不经手。
+    const instanceDb = path.join(gw.dataDir, "instances", "e2e-test-svc", "vectors.db");
+    // v3 auth contract: every /v2|/v3 request needs Bearer + x-tdai-service-id
+    // (v2-router resolveAuthContext) — the plugin client always sends both.
+    const v3Headers = { authorization: "Bearer e2e-test", "x-tdai-service-id": "e2e-test-svc" };
+    const v3Add = (userId: string, session: string, userText: string) =>
+      postJson<{ code: number; message?: string }>(gw.baseUrl, "/v3/conversation/add", {
+        // Plugin shape: placeholder team + real user — subsume rewrites the team.
+        team_id: "default",
+        agent_id: "default",
+        user_id: userId,
+        session_id: session,
+        messages: [{ role: "user", content: userText }, { role: "assistant", content: `ack ${session}` }],
+      }, v3Headers);
+    const v3ConvSearch = async (query: string, userId: string) => {
+      const { status, json } = await postJson<{ code: number; data?: { messages?: unknown[] } }>(
+        gw.baseUrl, "/v3/conversation/search",
+        { team_id: "default", agent_id: "default", user_id: userId, query, limit: 20 },
+        v3Headers,
+      );
+      expect(status, "/v3/conversation/search status").toBe(200);
+      expect(json.code).toBe(0);
+      return json.data?.messages?.length ?? 0;
+    };
+
+    try {
+      // ── §4.2(b) write gate: identity-less add is rejected, nothing lands ──
+      const gated = await postJson<{ code: number; message?: string }>(gw.baseUrl, "/v3/conversation/add", {
+        team_id: "default", agent_id: "default", session_id: "sess-gate",
+        messages: [{ role: "user", content: "no identity" }],
+      }, v3Headers);
+      expect(gated.status).toBe(400);
+      expect(gated.json.message ?? "").toContain("user_id");
+      expect(await sqliteQuery(instanceDb, "SELECT COUNT(*) AS n FROM l0_conversations WHERE session_id = ?", "sess-gate"))
+        .toEqual([{ n: 0 }]);
+
+      // ── dual-user v3 adds (2 rounds each → fixed L1 threshold 2) ──
+      for (let round = 1; round <= 2; round++) {
+        const addA = await v3Add("a", "sess-v3-a", `round ${round} for a: the raven ledger is kept in the attic`);
+        expect(addA.status).toBe(200);
+        const addB = await v3Add("b", "sess-v3-b", `round ${round} for b: the falcon manifest is filed at noon`);
+        expect(addB.status).toBe(200);
+      }
+
+      // ── subsume columns on L0 (main store, not per-user dirs) ──
+      const l0Teams = await pollSqlite(
+        instanceDb,
+        async () => await sqliteQuery<{ session_id: string; team_id: string; user_id: string }>(
+          instanceDb, "SELECT session_id, team_id, user_id FROM l0_conversations WHERE session_id IN (?, ?)", "sess-v3-a", "sess-v3-b"),
+        (rows) => rows.length >= 4 && rows.every((r) => r.team_id === r.user_id),
+      );
+      expect(new Set(l0Teams.map((r) => r.user_id))).toEqual(new Set(["a", "b"]));
+      // v3 数据面从不创建 per-user 物理 core 目录
+      expect(fs.existsSync(path.join(gw.dataDir, "users"))).toBe(false);
+
+      // ── real L1 extraction → subsume columns on L1 ──
+      await pollSqlite(
+        instanceDb,
+        async () => await sqliteQuery<{ team_id: string; user_id: string }>(
+          instanceDb, "SELECT team_id, user_id FROM l1_records WHERE session_key IN (?, ?)", "sess-v3-a", "sess-v3-b"),
+        (rows) => rows.length > 0 && rows.every((r) => r.team_id === r.user_id && r.team_id !== "default"),
+      );
+      expect(mock.requestCount()).toBeGreaterThan(0);
+
+      // ── §2.1 seam-1 端到端：真实 L2 运行把 per-user profile 存储域目录
+      // 落到磁盘（profiles/team:{uid}|agent:default/ —— core_read/scenario_ls
+      // 服务的就是这里；L2 任务键 profile:team:{uid}|agent:default|session:…
+      // 见子进程遥测 trace）。stateful 管线的 pipeline_states 不在 root
+      // checkpoint 文件里，磁盘目录是可轮询的权威落点。
+      const userScopeDir = (uid: string) =>
+        path.join(gw.dataDir, "profiles", encodeURIComponent(`team:${uid}|agent:default`));
+      await pollUntil(
+        () => fs.existsSync(userScopeDir("a")) && fs.existsSync(userScopeDir("b")),
+        L1_EXTRACTION_TIMEOUT_MS,
+        "per-user profile scope dirs profiles/team:{a,b}|agent:default on disk",
+      );
+
+      // ── v3 read surface: own tokens visible, other user's L0-only tokens invisible ──
+      await pollUntil(
+        async () => (await v3ConvSearch("raven ledger", "a")) > 0,
+        SEARCH_VISIBLE_TIMEOUT_MS,
+        "user a sees own conversation via /v3/conversation/search",
+      );
+      expect(await v3ConvSearch("falcon manifest", "a")).toBe(0);
+      await pollUntil(
+        async () => (await v3ConvSearch("falcon manifest", "b")) > 0,
+        SEARCH_VISIBLE_TIMEOUT_MS,
+        "user b sees own conversation via /v3/conversation/search",
+      );
+      expect(await v3ConvSearch("raven ledger", "b")).toBe(0);
     } finally {
       await gw.stop();
       await mock.close();
