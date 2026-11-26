@@ -36,7 +36,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from agent.memory_provider import MemoryProvider
 
@@ -147,15 +147,132 @@ def _resolve_gateway_host(default: str = _DEFAULT_GATEWAY_HOST) -> str:
     return host or default
 
 
+_GATEWAY_API_KEY_VARS = ("MEMORY_TENCENTDB_GATEWAY_API_KEY", "TDAI_GATEWAY_API_KEY")
+
+_DOTENV_HELPER_TIMEOUT_S = 3.0
+
+_DotenvLookupOutcome = Literal["ok", "error", "timeout"]
+
+
+def _dotenv_lookup_bounded(get_env_prefer_dotenv, var: str) -> tuple[_DotenvLookupOutcome, Any]:
+    """Run one credential-pool lookup under a hard timeout.
+
+    Returns ``("ok", value)``, ``("error", exception)`` or ``("timeout", None)``.
+    The worker is a daemon thread: on timeout it is abandoned (the underlying
+    call, if it ever completes, writes into a dict nobody reads) and the
+    resolver degrades instead of blocking registration.
+    """
+    outcome: Dict[str, Any] = {}
+
+    def _run() -> None:
+        # BaseException, not Exception: in an isolated daemon worker even a
+        # SystemExit/KeyboardInterrupt must land in the outcome dict instead
+        # of escaping to threading.excepthook and spraying a stderr
+        # traceback. The caller logs the class name only, so this stays
+        # inside the no-credential-material-in-logs contract.
+        try:
+            outcome["value"] = get_env_prefer_dotenv(var).strip()
+        except BaseException as exc:  # noqa: BLE001 — isolated on purpose
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(_DOTENV_HELPER_TIMEOUT_S)
+    if worker.is_alive():
+        return "timeout", None
+    if "error" in outcome:
+        return "error", outcome["error"]
+    return "ok", outcome.get("value", "")
+
+
 def _resolve_gateway_api_key() -> Optional[str]:
-    """Read the optional Gateway Bearer token from the environment."""
-    for var in ("MEMORY_TENCENTDB_GATEWAY_API_KEY", "TDAI_GATEWAY_API_KEY"):
+    """Read the optional Gateway Bearer token from the environment or the
+    Hermes ``.env`` (profile-aware ``<hermes_home>/.env``).
+
+    Looks at ``MEMORY_TENCENTDB_GATEWAY_API_KEY`` (Hermes-namespaced) first;
+    falls back to ``TDAI_GATEWAY_API_KEY`` so an operator who already wired
+    up the Gateway-side env var does not have to set two names. Returns
+    ``None`` when neither source yields a value. Whitespace-only values are
+    treated as unset to guard against shells that quote ``\\n`` into env
+    vars.
+
+    Service processes (launchd, systemd) never inherit shell exports, so the
+    operator's ``.env`` — the canonical Hermes secret store, resolved
+    profile-aware via ``get_env_prefer_dotenv`` (``<hermes_home>/.env``) — is
+    consulted as a fallback once neither variable is present in the process
+    environment. That helper reads the dotenv file and the 1Password secret
+    scope (secret_scope itself may fall back to ``os.environ`` when no
+    multiplex scope is active), making it a complement to the loop above
+    rather than a duplicate. A helper failure on one variable is logged
+    (exception class name and variable name only — never the message or
+    traceback, which could embed credential material) and skipped; the
+    credential-pool import is contained the same way. This resolver never
+    raises, so it cannot break provider registration where ``is_available``
+    must never throw.
+
+    Rotation caveat: the environment loop wins whenever a value is present,
+    so a long-lived process keeps using the key it loaded at startup even
+    after every ``.env`` copy has been updated — the dotenv fallback only
+    covers processes that never had the key. Rotating the key therefore
+    means updating all ``.env`` copies AND restarting the gateway (or
+    otherwise reloading the process environment).
+
+    Important: this is purely the **client-side** secret. Whether the
+    Gateway actually enforces a Bearer check is decided on the Gateway
+    side (its own ``TDAI_GATEWAY_API_KEY`` / ``server.apiKey``); the
+    plugin does not propagate this value across to the spawned Gateway.
+    The operator must configure the same secret on both ends if they
+    want auth enforcement.
+
+    (Restored 2026-11-26: the 9-22 layout port rewrote this resolver to
+    env-only and silently dropped the 09-16 401-campaign defenses — dotenv
+    fallback, per-variable isolation, sanitized logging, timeout bound.
+    The dropped tests came back with it; see test_gateway_api_key.py.)
+    """
+    for var in _GATEWAY_API_KEY_VARS:
         raw = os.environ.get(var)
         if raw is None:
             continue
         value = raw.strip()
         if value:
             return value
+    try:
+        from agent.credential_pool import get_env_prefer_dotenv
+    except Exception as exc:
+        # Stub/partial checkouts don't ship the credential pool (ImportError)
+        # and a broken checkout can fail with anything else — either way the
+        # dotenv fallback is silently unavailable and legacy env-only
+        # behaviour applies. Class name only: never the message/traceback.
+        logger.debug(
+            "credential pool import failed (%s); no dotenv fallback",
+            type(exc).__name__,
+        )
+        return None
+    for var in _GATEWAY_API_KEY_VARS:
+        outcome, payload = _dotenv_lookup_bounded(get_env_prefer_dotenv, var)
+        if outcome == "error":
+            # Per-variable isolation: a misbehaving helper degrades to the
+            # next variable instead of escaping into provider registration.
+            # Only the exception class name and the variable name are logged
+            # — never the message or traceback, because helper exception
+            # text is operator-adjacent data and may embed credential
+            # material. warning (not debug) keeps the failure visible for
+            # attribution when the client later sends no/failed Bearer auth.
+            logger.warning(
+                "dotenv fallback lookup failed for %s (%s)",
+                var,
+                type(payload).__name__,
+            )
+            continue
+        if outcome == "timeout":
+            logger.warning(
+                "dotenv fallback lookup timed out for %s (>%.0fs); skipping this variable",
+                var,
+                _DOTENV_HELPER_TIMEOUT_S,
+            )
+            continue
+        if payload:
+            return payload
     return None
 
 
