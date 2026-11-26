@@ -93,7 +93,7 @@ standalone 模式下「库在哪」只由两个点决定，且都以 `instanceId
 
 ## 4. 路由规则
 
-仅当 `multiUser.enabled` 为真时生效。规则 #1 适用于所有 `/v2/*`、`/v3/*` 路由；规则 #2–#6 只在请求命中 v3 记忆数据面 18 条路由（`V3_ALLOWED_SUBPATHS`，`v2-router.ts:154`）时判定。技能、知识库、元数据、chat-memory 等管理面路由（`isV3Extra`）与 `/v2/*` 除 #1 外行为不变。
+规则 #1 在任何状态下都生效，适用于所有 `/v2/*`、`/v3/*` 路由（保留前缀与开关无关：开关关着时客户端自发这个前缀也会让网关去开别人的目录）。规则 #2–#6 仅当 `multiUser.enabled` 为真、且请求命中 v3 记忆数据面 18 条路由（`V3_ALLOWED_SUBPATHS`，`v2-router.ts:154`）时判定。技能、知识库、元数据、chat-memory 等管理面路由（`isV3Extra`）与 `/v2/*` 除 #1 外行为不变。
 
 判定顺序（前一条命中即止）：
 
@@ -301,7 +301,7 @@ v1 协议的按人 core 路径及其 11 条单测原样保留。
 
 ## 11. 安全边界
 
-- **保留前缀**：`x-tdai-service-id` 的值只校验非空（`parseV2Auth`，`v2-router.ts:440`），客户端可以自己填 `user:教师 A` 去指到别人的库。因此 `multiUser.enabled` 时，该头以 `user:` 开头一律 400。用户域实例号只能由网关内部根据归一化后的 `user_id` 构造。
+- **保留前缀**：`x-tdai-service-id` 的值只校验非空（`parseV2Auth`，`v2-router.ts:440`），客户端可以自己填 `user:教师 A` 去指到别人的库。因此该头以 `user:` 开头一律 400，与开关状态无关。用户域实例号只能由网关内部根据归一化后的 `user_id` 构造。
 - **目录穿越**：uid 必须匹配 `^[a-z0-9_-]{1,64}$` 才会被拼进路径；`buildUserScopeInstanceId` 对非法 uid 抛错；`LocalStorageBackend` 另有根目录逃逸检查。
 - **信任边界同 09-14**：网关绑定 127.0.0.1，本方案防用户之间串库，不防持有网关密钥的本地进程——`user_id` 是调用方自声明字段，持钥者本来就能冒充任意 uid。
 - **日志**：uid 是标识符，可以进日志；记忆内容、查询文本不进日志（现有约定）。
@@ -328,7 +328,7 @@ v1 协议的按人 core 路径及其 11 条单测原样保留。
 **e2e**（真实网关，隔离端口 + 临时目录 + mock LLM，沿用现有 `gateway.multi-user.e2e.test.ts` 的基建）
 
 1. 两个用户各自写入后互不可见；根库无两人的行；`default` 身份写入 400；owner 写入落根库。
-2. 管线按人运行：L1 抽进 `users/<uid>/vectors.db`；场景块与画像落在 `users/<uid>/profiles/…/`；mock LLM 收到的系统提示词是 chat 口径；另一人目录无产物。
+2. 管线按人运行：L1 抽进 `users/<uid>/vectors.db`；`users/<uid>/profiles/…/` 作用域目录出现，而根目录下没有对应目录；mock LLM 收到的 L1 系统提示词是 chat 口径。场景块与画像文件本身不由 e2e 断言——mock LLM 不产生工具调用，写不出文件；L2/L3 落在本人目录由单测钉住（`createL2Runner` / `createL3Runner` 收到的目录入参）。
 3. 既有 5 条 e2e 中前 4 条（v1 按人库、开关关闭、api-key、v1 真实 L1 管线）原样续跑，确认未回归；第 5 条（subsume 场景）由上面两条取代。
 
 **副本演练**（上 live 前的必经步骤，不属于自动化测试）
