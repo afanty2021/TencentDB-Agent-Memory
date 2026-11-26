@@ -123,14 +123,14 @@ describe("multiUser config loading", () => {
 
   it("reads TDAI_MULTI_USER_OWNERS, normalizing entries and dropping invalid ones", () => {
     vi.stubEnv("TDAI_MULTI_USER", "true");
-    vi.stubEnv("TDAI_MULTI_USER_OWNERS", "HuangZhengBo, wendy.li , Wang , dup , dup");
+    vi.stubEnv("TDAI_MULTI_USER_OWNERS", "HuangZhengBo, walnut.li , Wang , dup , dup");
     const cfg = loadGatewayConfig();
     expect(cfg.multiUser.enabled).toBe(true);
     expect(cfg.multiUser.ownerUserIds).toEqual(["huangzhengbo", "wang", "dup"]);
     // The dropped invalid entry is announced (operator typo visibility).
     const dropWarn = stderrSpy.mock.calls.find((call) => String(call[0]).includes("dropping invalid multiUser.ownerUserIds entry"));
     expect(dropWarn).toBeTruthy();
-    expect(String(dropWarn![0])).toContain("wendy.li");
+    expect(String(dropWarn![0])).toContain("walnut.li");
   });
 
   it("reads yaml multiUser.enabled / multiUser.ownerUserIds", () => {
@@ -170,14 +170,14 @@ describe("TdaiGateway per-user core routing", () => {
     //（向量行列由 sqlite 归一逻辑兜底，JSONL 镜像是可断言的可见面）。
     const { gw, resolve, baseDir } = makeGateway({ enabled: true });
     try {
-      const wendy = await resolve("wendy");
-      await wendy.handleTurnCommitted({
+      const walnut = await resolve("walnut");
+      await walnut.handleTurnCommitted({
         userText: "hi", assistantText: "hello",
         messages: [{ role: "user", content: "hi" }, { role: "assistant", content: "hello" }],
         sessionKey: "s1", sessionId: "s1",
       });
-      const jsonl = readAllJsonl(path.join(baseDir, "users", "wendy", "conversations"));
-      expect(jsonl).toContain('"userId":"wendy"');
+      const jsonl = readAllJsonl(path.join(baseDir, "users", "walnut", "conversations"));
+      expect(jsonl).toContain('"userId":"walnut"');
     } finally {
       await gw.stop();
     }
@@ -191,20 +191,20 @@ describe("TdaiGateway per-user core routing", () => {
     const { gw, resolve, baseDir } = makeGateway({ enabled: true });
     try {
       const main = await resolve(undefined);
-      const wendy = await resolve("wendy");
+      const walnut = await resolve("walnut");
 
       // 两个 scope 各放一份 persona（路径规则 = buildProfileIsolationScope + encodeURIComponent）
       const scopeDir = (scope: string, root: string) =>
         path.join(root, "profiles", encodeURIComponent(scope));
-      const wendyDir = scopeDir("team:wendy|agent:default", path.join(baseDir, "users", "wendy"));
+      const walnutDir = scopeDir("team:walnut|agent:default", path.join(baseDir, "users", "walnut"));
       const mainDir = scopeDir("team:default|agent:default", baseDir);
-      fs.mkdirSync(wendyDir, { recursive: true });
+      fs.mkdirSync(walnutDir, { recursive: true });
       fs.mkdirSync(mainDir, { recursive: true });
-      fs.writeFileSync(path.join(wendyDir, "persona.md"), "wendy-persona-content");
+      fs.writeFileSync(path.join(walnutDir, "persona.md"), "walnut-persona-content");
       fs.writeFileSync(path.join(mainDir, "persona.md"), "main-default-persona");
 
-      const wendyRecall = await wendy.handleBeforeRecall("hello", "s1");
-      expect(wendyRecall?.recalledL3Persona ?? "").toContain("wendy-persona-content");
+      const walnutRecall = await walnut.handleBeforeRecall("hello", "s1");
+      expect(walnutRecall?.recalledL3Persona ?? "").toContain("walnut-persona-content");
 
       const mainRecall = await main.handleBeforeRecall("hello", "s1");
       expect(mainRecall?.recalledL3Persona ?? "").toContain("main-default-persona");
@@ -217,21 +217,21 @@ describe("TdaiGateway per-user core routing", () => {
     const { gw, resolve, baseDir } = makeGateway({ enabled: true, ownerUserIds: ["huangzhengbo"] });
     try {
       const mainCore = await resolve(undefined);
-      const wendy = await resolve("Wendy");
+      const walnut = await resolve("Walnut");
 
-      expect(wendy).toBeInstanceOf(TdaiCore);
-      expect(wendy).not.toBe(mainCore);
+      expect(walnut).toBeInstanceOf(TdaiCore);
+      expect(walnut).not.toBe(mainCore);
 
       // Normalized uid variants share one core (Map dedup + promise dedup).
-      expect(await resolve("wendy")).toBe(wendy);
-      expect(await resolve("  WENDY  ")).toBe(wendy);
+      expect(await resolve("walnut")).toBe(walnut);
+      expect(await resolve("  WALNUT  ")).toBe(walnut);
 
       // A second user gets her own core.
-      expect(await resolve("li-hua")).not.toBe(wendy);
+      expect(await resolve("li-hua")).not.toBe(walnut);
       expect(await resolve("li-hua")).not.toBe(mainCore);
 
       // Per-user data layout: <baseDir>/users/<uid>/ (initialize() creates it).
-      expect(fs.existsSync(path.join(baseDir, "users", "wendy"))).toBe(true);
+      expect(fs.existsSync(path.join(baseDir, "users", "walnut"))).toBe(true);
       expect(fs.existsSync(path.join(baseDir, "users", "li-hua"))).toBe(true);
     } finally {
       await gw.stop();
@@ -245,7 +245,7 @@ describe("TdaiGateway per-user core routing", () => {
       expect(await resolve("huangzhengbo")).toBe(mainCore);
       expect(await resolve("HuangZhengBo")).toBe(mainCore);
       expect(await resolve("default")).toBe(mainCore);
-      expect(await resolve("wendy.li")).toBe(mainCore); // fail-closed, no stripping
+      expect(await resolve("walnut.li")).toBe(mainCore); // fail-closed, no stripping
       expect(await resolve("../etc/passwd")).toBe(mainCore);
       expect(await resolve(42)).toBe(mainCore);
       expect(await resolve("")).toBe(mainCore);
@@ -264,7 +264,7 @@ describe("TdaiGateway per-user core routing", () => {
       await resolve("default");
       expect(warnSpy).not.toHaveBeenCalled();
 
-      await resolve("wendy.li");
+      await resolve("walnut.li");
       expect(warnSpy).toHaveBeenCalledTimes(1);
       expect(String(warnSpy.mock.calls[0]?.[0])).toContain("Invalid or missing user_id");
     } finally {
@@ -276,9 +276,9 @@ describe("TdaiGateway per-user core routing", () => {
     const { gw, resolve, baseDir } = makeGateway({ enabled: false, ownerUserIds: [] });
     try {
       const mainCore = await resolve(undefined);
-      expect(await resolve("wendy")).toBe(mainCore);
-      expect(await resolve("wendy.li")).toBe(mainCore);
-      expect(await resolve("Wendy")).toBe(mainCore);
+      expect(await resolve("walnut")).toBe(mainCore);
+      expect(await resolve("walnut.li")).toBe(mainCore);
+      expect(await resolve("Walnut")).toBe(mainCore);
       expect(fs.existsSync(path.join(baseDir, "users"))).toBe(false);
     } finally {
       await gw.stop();
@@ -288,7 +288,7 @@ describe("TdaiGateway per-user core routing", () => {
   it("isolates per-user stores: each user's capture lands only in its own directory", async () => {
     const { gw, resolve, baseDir } = makeGateway({ enabled: true, ownerUserIds: [] });
     try {
-      const wendy = await resolve("wendy");
+      const walnut = await resolve("walnut");
       const lihua = await resolve("li-hua");
 
       // startedAt in the past: L0 only records messages strictly newer than
@@ -306,20 +306,20 @@ describe("TdaiGateway per-user core routing", () => {
         startedAt,
       });
 
-      const wendyResult = await wendy.handleTurnCommitted(turn("sess-wendy-1"));
-      expect(wendyResult.l0RecordedCount).toBeGreaterThan(0);
+      const walnutResult = await walnut.handleTurnCommitted(turn("sess-walnut-1"));
+      expect(walnutResult.l0RecordedCount).toBeGreaterThan(0);
       const lihuaResult = await lihua.handleTurnCommitted(turn("sess-lihua-1"));
       expect(lihuaResult.l0RecordedCount).toBeGreaterThan(0);
 
-      const wendyJsonl = readAllJsonl(path.join(baseDir, "users", "wendy", "conversations"));
+      const walnutJsonl = readAllJsonl(path.join(baseDir, "users", "walnut", "conversations"));
       const lihuaJsonl = readAllJsonl(path.join(baseDir, "users", "li-hua", "conversations"));
-      expect(wendyJsonl).toContain("sess-wendy-1");
-      expect(wendyJsonl).not.toContain("sess-lihua-1");
+      expect(walnutJsonl).toContain("sess-walnut-1");
+      expect(walnutJsonl).not.toContain("sess-lihua-1");
       expect(lihuaJsonl).toContain("sess-lihua-1");
-      expect(lihuaJsonl).not.toContain("sess-wendy-1");
+      expect(lihuaJsonl).not.toContain("sess-walnut-1");
 
       // The main store stays free of per-user captures.
-      expect(readAllJsonl(path.join(baseDir, "conversations"))).not.toContain("sess-wendy-1");
+      expect(readAllJsonl(path.join(baseDir, "conversations"))).not.toContain("sess-walnut-1");
       expect(readAllJsonl(path.join(baseDir, "conversations"))).not.toContain("sess-lihua-1");
     } finally {
       await gw.stop();
@@ -328,14 +328,14 @@ describe("TdaiGateway per-user core routing", () => {
 
   it("stop() destroys every live per-user core", async () => {
     const { gw, resolve } = makeGateway({ enabled: true, ownerUserIds: [] });
-    const wendy = await resolve("wendy");
+    const walnut = await resolve("walnut");
     const lihua = await resolve("li-hua");
-    const wendyDestroy = vi.spyOn(wendy, "destroy");
+    const walnutDestroy = vi.spyOn(walnut, "destroy");
     const lihuaDestroy = vi.spyOn(lihua, "destroy");
 
     await gw.stop();
 
-    expect(wendyDestroy).toHaveBeenCalled();
+    expect(walnutDestroy).toHaveBeenCalled();
     expect(lihuaDestroy).toHaveBeenCalled();
   });
 
@@ -353,35 +353,35 @@ describe("TdaiGateway per-user core routing", () => {
       });
     const startedAt = Date.now() - 60_000;
 
-    // Gateway 1: capture data for wendy, then stop — destroy() closes the
+    // Gateway 1: capture data for walnut, then stop — destroy() closes the
     // store and resets the per-dataDir store cache, so gateway 2 starts cold.
     const gw1 = make();
-    const wendy1 = await (gw1 as unknown as { _resolveCore: (raw: unknown) => Promise<TdaiCore> })
-      ._resolveCore.bind(gw1)("wendy");
-    const capture = await wendy1.handleTurnCommitted({
-      userText: "hello from sess-wendy-cold",
+    const walnut1 = await (gw1 as unknown as { _resolveCore: (raw: unknown) => Promise<TdaiCore> })
+      ._resolveCore.bind(gw1)("walnut");
+    const capture = await walnut1.handleTurnCommitted({
+      userText: "hello from sess-walnut-cold",
       assistantText: "hi there",
       messages: [
-        { role: "user", content: "hello from sess-wendy-cold" },
+        { role: "user", content: "hello from sess-walnut-cold" },
         { role: "assistant", content: "hi there" },
       ],
-      sessionKey: "sess-wendy-cold",
+      sessionKey: "sess-walnut-cold",
       startedAt,
     });
     expect(capture.l0RecordedCount).toBeGreaterThan(0);
     await gw1.stop();
 
-    // Gateway 2 (same baseDir, empty userCores): wendy's FIRST request is a
+    // Gateway 2 (same baseDir, empty userCores): walnut's FIRST request is a
     // search on a cold core. Before the fix the search ran before store init
     // completed and returned the {total: 0, strategy: "none"} degradation.
     const gw2 = make();
     try {
-      const wendy2 = await (gw2 as unknown as { _resolveCore: (raw: unknown) => Promise<TdaiCore> })
-        ._resolveCore.bind(gw2)("wendy");
-      expect(wendy2).not.toBe(wendy1); // fresh cold core, not the warmed one
-      expect(wendy2.getVectorStore()).toBeDefined(); // store ready before search
+      const walnut2 = await (gw2 as unknown as { _resolveCore: (raw: unknown) => Promise<TdaiCore> })
+        ._resolveCore.bind(gw2)("walnut");
+      expect(walnut2).not.toBe(walnut1); // fresh cold core, not the warmed one
+      expect(walnut2.getVectorStore()).toBeDefined(); // store ready before search
 
-      const result = await wendy2.searchConversations({ query: "hello from sess-wendy-cold" });
+      const result = await walnut2.searchConversations({ query: "hello from sess-walnut-cold" });
       expect(result.total).toBeGreaterThan(0);
     } finally {
       await gw2.stop();
@@ -530,7 +530,7 @@ describe("applyMultiUserV3Routing (v3 data-plane per-user ctx rewrite)", () => {
   });
 
   it("rejects invalid user_id fail-closed without echoing the value", () => {
-    for (const bad of ["wendy.li", "a|team:admin", "../etc/passwd", "x".repeat(65), ""]) {
+    for (const bad of ["walnut.li", "a|team:admin", "../etc/passwd", "x".repeat(65), ""]) {
       const r = applyMultiUserV3Routing(ctx({ userId: bad }), "/conversation/add");
       expect(r.ok).toBe(false);
       // 报字段名不报值（非空非法值不得回显；空串本身就是"值缺席"）
@@ -735,10 +735,10 @@ describe("v3 dispatch wiring (multiUser subsume at handleV2Route level)", () => 
 
   it("rejects an invalid user_id with 400 before any write happens", async () => {
     const store = fakeL0Store();
-    const r = await dispatchV3(store, "/conversation/add", addBody("wendy.li"), { multiUser: true });
+    const r = await dispatchV3(store, "/conversation/add", addBody("walnut.li"), { multiUser: true });
     expect(r.status).toBe(400);
     expect(r.body.message).toContain("user_id");
-    expect(r.body.message).not.toContain("wendy.li");
+    expect(r.body.message).not.toContain("walnut.li");
     expect(store.rows).toHaveLength(0);
     expect(r.assetRegistrations).toBe(0);
   });
@@ -1013,12 +1013,12 @@ describe("/v3/chat-memory/clear user-scope mode (multiUser)", () => {
   it("rejects invalid user_id fail-closed without echoing the value", async () => {
     const store = fakeClearStore();
     const r = await dispatchChatMemoryClear(
-      { user_ids: ["alice", "wendy.li"] },
+      { user_ids: ["alice", "walnut.li"] },
       { multiUser: true, store },
     );
     expect(r.status).toBe(400);
     expect(r.body.message).toContain("user_id");
-    expect(r.body.message).not.toContain("wendy.li");
+    expect(r.body.message).not.toContain("walnut.li");
     expect(store.clearCalls).toHaveLength(0); // 整批拒绝，一条不清
   });
 
