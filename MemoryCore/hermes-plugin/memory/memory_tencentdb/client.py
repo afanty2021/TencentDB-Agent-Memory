@@ -19,6 +19,36 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 10  # seconds
 
+# Gateway schema pins free-text queries at z.string().min(1).max(2048)
+# (src/gateway/generated/schemas.ts — atomicSearchRequestSchema and
+# conversationSearchRequestSchema). Zod's .max() counts UTF-16 code units
+# (JS String.prototype.length), not Python code points, so clamping by
+# len() alone would still let emoji-heavy queries through to a 400.
+GATEWAY_MAX_QUERY_UNITS = 2048
+
+
+def truncate_query_utf16(query: str, max_units: int = GATEWAY_MAX_QUERY_UNITS) -> str:
+    """Clamp a free-text query to the Gateway's zod max limit (UTF-16 units).
+
+    Queries arrive verbatim from the user turn (prefetch) or tool args, so
+    the clamp lives here — the single choke point shared by every caller.
+    Encoding to utf-16-le and slicing on code-unit boundaries mirrors the
+    server-side check exactly; ``errors="ignore"`` on the way back drops a
+    trailing half surrogate when the cut lands inside a surrogate pair.
+    Logs lengths only — query text is user conversation content.
+    """
+    encoded = query.encode("utf-16-le", errors="replace")
+    limit_bytes = max_units * 2
+    if len(encoded) <= limit_bytes:
+        return query
+    truncated = encoded[:limit_bytes].decode("utf-16-le", errors="ignore")
+    logger.warning(
+        "memory-tencentdb query truncated to Gateway limit: %d -> %d UTF-16 units",
+        len(encoded) // 2,
+        len(truncated.encode("utf-16-le")) // 2,
+    )
+    return truncated
+
 
 class MemoryTencentdbSdkClient:
     """HTTP client for the memory-tencentdb Gateway sidecar."""
@@ -147,7 +177,7 @@ class MemoryTencentdbSdkClient:
             "team_id": team_id,
             "agent_id": agent_id,
             "user_id": user_id,
-            "query": query,
+            "query": truncate_query_utf16(query),
             "limit": limit,
         }
         if session_id:
@@ -171,7 +201,7 @@ class MemoryTencentdbSdkClient:
             "team_id": team_id,
             "agent_id": agent_id,
             "user_id": user_id,
-            "query": query,
+            "query": truncate_query_utf16(query),
             "limit": limit,
         }
         if type_filter:
