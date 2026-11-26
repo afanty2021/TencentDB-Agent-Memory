@@ -266,7 +266,7 @@ node --import tsx scripts/import-per-user-stores.ts --data-dir <baseDir> [--owne
 
 **dry-run 只读**：不建目录、不以写方式打开任何库；对旧库只读 `pragma table_info` 判断「将被原地升级」并报告。
 
-**确认后的自检**（不通过则非零退出）：每个 uid 的用户库 `count(user_id = uid)` 不少于主库该 uid 行数；主库 L0/L1 总行数执行前后相等。
+**确认后的自检**（不通过则非零退出）：每个 uid 的用户库里所有行都归属本人，且 `count(user_id = uid)` 不少于主库该 uid 行数；主库 L0/L1 总行数执行后**不少于**执行前（导入期间网关仍在运行，主库可能新增；脚本从不删主库行，所以减少即异常）。
 
 **预期结果（2026-11-26 数据）**：
 
