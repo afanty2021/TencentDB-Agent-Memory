@@ -518,6 +518,52 @@ describe("TdaiGateway per-user core routing", () => {
 
 const ROUTING_ON = { multiUserEnabled: true, ownerUserIds: ["huangzhengbo"] };
 
+describe("per-user store roots (v3 user-scoped instances)", () => {
+  type ResolveStorage = (instanceId: string) => Promise<StorageAdapter>;
+  const resolverOf = (gw: TdaiGateway): ResolveStorage =>
+    (gw as unknown as { resolveFileOthersForInstance: ResolveStorage }).resolveFileOthersForInstance.bind(gw);
+
+  it("roots a user-scoped instance's files at <baseDir>/users/<uid> and creates the data subdirs", async () => {
+    const { gw, baseDir } = makeGateway({ enabled: true, ownerUserIds: [] });
+    try {
+      const resolve = resolverOf(gw);
+
+      const userStorage = await resolve("user:walnut");
+      await userStorage.appendFile("conversations/2026-01-01.jsonl", '{"hello":1}\n');
+
+      const userDir = path.join(baseDir, "users", "walnut");
+      expect(fs.existsSync(path.join(userDir, "conversations", "2026-01-01.jsonl"))).toBe(true);
+      for (const sub of ["records", "scene_blocks", ".metadata", ".backup"]) {
+        expect(fs.existsSync(path.join(userDir, sub)), sub).toBe(true);
+      }
+      // The main store's mirror is untouched by the user's write.
+      expect(fs.existsSync(path.join(baseDir, "conversations", "2026-01-01.jsonl"))).toBe(false);
+
+      const mainStorage = await resolve("default");
+      await mainStorage.appendFile("conversations/2026-01-01.jsonl", '{"hello":2}\n');
+      expect(fs.existsSync(path.join(baseDir, "conversations", "2026-01-01.jsonl"))).toBe(true);
+      expect(fs.existsSync(path.join(userDir, "conversations", "2026-01-01.jsonl"))).toBe(true);
+    } finally {
+      await gw.stop();
+    }
+  });
+
+  it("keeps one cached adapter per instance id (a user never reuses another instance's root)", async () => {
+    const { gw } = makeGateway({ enabled: true, ownerUserIds: [] });
+    try {
+      const resolve = resolverOf(gw);
+      const a = await resolve("user:a");
+      const b = await resolve("user:b");
+      const main = await resolve("default");
+      expect(a).not.toBe(b);
+      expect(a).not.toBe(main);
+      expect(await resolve("user:a")).toBe(a); // cached
+    } finally {
+      await gw.stop();
+    }
+  });
+});
+
 describe("routeV3ByUser (v3 data-plane per-user store routing)", () => {
   it("routes a regular user to the user pool with a user:<uid> scope instance id", () => {
     const expected = { ok: true, pool: "user", uid: "alice", scopeInstanceId: "user:alice" };

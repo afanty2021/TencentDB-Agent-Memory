@@ -58,6 +58,7 @@ import { initObservabilityBackend } from "../core/report/factory.js";
 import type { ObservabilityConfig as CoreObservabilityConfig } from "../core/report/types.js";
 import { TracedTaskExecutor } from "../core/report/traced-task-executor.js";
 import { StorePool } from "../core/store/store-pool.js";
+import { resolveScopeDataRoot } from "../core/store/store-scope.js";
 import { validateAndNormalizeRaw, SeedValidationError } from "../core/seed/input.js";
 import { executeSeed } from "../core/seed/seed-runtime.js";
 import type { SeedProgress } from "../core/seed/types.js";
@@ -2907,9 +2908,14 @@ export class TdaiGateway {
     const cached = this.cosStorageCache?.get(instanceId);
     if (cached) return cached;
 
-    // Standalone mode: fall back to local storage (no COS needed)
+    // Standalone mode: fall back to local storage (no COS needed).
+    // User-scoped instances (user:<uid>) root their files in the user's own
+    // directory; every other instance shares baseDir
+    // (docs/per-user-stores-v3-design.md §6.4).
     if (!this.sharedCosClient && this.config.deployMode === "standalone") {
-      const localDir = this.config.data.baseDir;
+      const root = resolveScopeDataRoot(this.config.data.baseDir, instanceId);
+      if (root.scoped) initDataDirectories(root.dataDir);
+      const localDir = root.dataDir;
       const backend = new LocalStorageBackend({ rootDir: localDir, logger: this.logger });
       const adapter = new StorageAdapter(backend);
       if (!this.cosStorageCache) this.cosStorageCache = new Map();
