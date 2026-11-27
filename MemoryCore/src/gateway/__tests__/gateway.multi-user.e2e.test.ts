@@ -17,6 +17,15 @@
  *     isolated across users (plan §7.2)
  *   - with `TDAI_GATEWAY_API_KEY` set, missing/wrong Bearer → 401, correct
  *     Bearer → 200, `GET /health` stays reachable without a token
+ *   - v3 per-user stores: /v3 writes by regular users land in
+ *     users/<uid>/vectors.db (team_id stays "default"), cross-invisible;
+ *     identity-less writes → 400; owners stay in the main store; a
+ *     client-supplied "user:" service id → 400, on the v3 data plane AND on
+ *     /v2/offload/* (request-router-level guard)
+ *   - v3 per-user pipeline: L1 rows in the user database, profile scope dir
+ *     under the user directory, L1 system prompt in the chat family
+ *     (multiUser.userPromptMode) while the global family stays "code"
+ *   - service mode + multiUser.enabled refuses to boot (start() wiring)
  *
  * Environment red lines (this machine runs a production gateway):
  *   - the test gateways bind 127.0.0.1:1842x, never 8420
@@ -48,8 +57,12 @@ const PORT_MULTI_USER = 18420;
 const PORT_LEGACY = 18421;
 const PORT_AUTH = 18422;
 const PORT_L1_ISOLATION = 18423;
-/** v3-subsume-surface scenario (design §6.3). */
-const PORT_V3_SUBSUME = 18424;
+/** v3 per-user stores: physical isolation on the v3 data plane (per-user-stores design §12). */
+const PORT_V3_STORES = 18424;
+/** v3 per-user pipeline: L1 rows, profile scope dir, chat prompt family (per-user-stores design §12). */
+const PORT_V3_PIPELINE = 18425;
+/** Boot-refusal pin: service mode + multiUser.enabled must fail at start() (design §6.6; review I5). */
+const PORT_V3_BOOT_REFUSAL = 18426;
 /** In-test mock OpenAI-compatible LLM server (used by the L1 isolation test). */
 const PORT_MOCK_LLM = 18430;
 
@@ -141,6 +154,8 @@ async function startGateway(opts: {
   port: number;
   multiUser?: boolean;
   ownerUserIds?: string[];
+  /** `multiUser.userPromptMode` — prompt family for user-scoped stores. */
+  userPromptMode?: "chat" | "code";
   /** Enable `TDAI_GATEWAY_API_KEY` Bearer auth on the child gateway. */
   apiKey?: string;
   /** Extra env vars injected into the child (e.g. the mock LLM endpoint). */
@@ -151,7 +166,7 @@ async function startGateway(opts: {
    */
   gatewayConfigFile?: Record<string, unknown>;
 }): Promise<GatewayHandle> {
-  const { port, multiUser = false, ownerUserIds = [], apiKey, extraEnv = {}, gatewayConfigFile = {} } = opts;
+  const { port, multiUser = false, ownerUserIds = [], apiKey, extraEnv = {}, gatewayConfigFile = {}, userPromptMode } = opts;
 
   // Red lines: never the production port, never outside the tmpdir.
   if (port === 8420) throw new Error("Refusing to start a test gateway on the production port 8420");
@@ -164,7 +179,12 @@ async function startGateway(opts: {
   const env: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (value === undefined) continue;
-    if (key.startsWith("TDAI_") || key.startsWith("MEMORY_TENCENTDB_") || key === "NODE_OPTIONS") continue;
+    if (
+      key.startsWith("TDAI_") || key.startsWith("MEMORY_TENCENTDB_") || key === "NODE_OPTIONS" ||
+      // Telemetry must never ship rehearsal/test memory fragments to a real
+      // backend just because the executor's shell exports keys (review I3).
+      key.startsWith("LANGFUSE_") || key.startsWith("OTEL_")
+    ) continue;
     env[key] = value;
   }
   env.TDAI_GATEWAY_HOST = "127.0.0.1";
@@ -175,8 +195,15 @@ async function startGateway(opts: {
     env.TDAI_MULTI_USER = "true";
     if (ownerUserIds.length > 0) env.TDAI_MULTI_USER_OWNERS = ownerUserIds.join(",");
   }
+  if (userPromptMode) env.TDAI_MULTI_USER_PROMPT_MODE = userPromptMode;
   if (apiKey) env.TDAI_GATEWAY_API_KEY = apiKey;
   Object.assign(env, extraEnv);
+  // No-mock scenarios must never egress (review I3): the gateway's hardcoded
+  // LLM default is https://api.openai.com/v1 with an empty key and extraction
+  // is enabled by default — the connection attempt itself is real egress, and
+  // patching the repo yaml is inert (TDAI_GATEWAY_CONFIG short-circuits it).
+  // Scenarios that provide a mock via extraEnv override this default.
+  env.TDAI_LLM_BASE_URL ??= "http://127.0.0.1:9/v1";
 
   const child = spawn(process.execPath, ["--import", "tsx", SERVER_ENTRY], {
     cwd: REPO_ROOT,
@@ -283,6 +310,8 @@ interface MockLlmHandle {
   baseUrl: string;
   /** Number of chat-completion requests the mock answered. */
   requestCount: () => number;
+  /** System-prompt contents of every answered request, in arrival order. */
+  systemPrompts: () => string[];
   close: () => Promise<void>;
 }
 
@@ -301,11 +330,28 @@ interface MockLlmHandle {
  */
 async function startMockLlmServer(): Promise<MockLlmHandle> {
   let requests = 0;
+  const systemPrompts: string[] = [];
   const server = http.createServer((req, res) => {
-    req.resume(); // drain the request body so `end` fires and upload never stalls
+    // Buffer the request body instead of merely draining it: the `end` event
+    // still only fires once the upload finished (see the doc comment above),
+    // and the buffered body lets us record the system prompt.
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("error", () => res.destroy());
     req.on("end", () => {
       requests += 1;
+      try {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString("utf-8")) as {
+          messages?: Array<{ role?: string; content?: unknown }>;
+        };
+        for (const message of parsed.messages ?? []) {
+          if (message.role === "system" && typeof message.content === "string") {
+            systemPrompts.push(message.content);
+          }
+        }
+      } catch {
+        // Non-JSON body — nothing to record.
+      }
       const body = JSON.stringify({
         id: "chatcmpl-e2e-mock",
         object: "chat.completion",
@@ -338,6 +384,7 @@ async function startMockLlmServer(): Promise<MockLlmHandle> {
   return {
     baseUrl: `http://127.0.0.1:${PORT_MOCK_LLM}/v1`,
     requestCount: () => requests,
+    systemPrompts: () => [...systemPrompts],
     close: () =>
       new Promise<void>((resolve) => {
         server.close(() => resolve());
@@ -899,46 +946,17 @@ describeRealGateway("gateway multi-user e2e (real subprocess + HTTP)", () => {
     }
   });
 
-  it("v3 subsume surface: identity-less writes 400, dual-user team columns, per-user L2 task keys, no cross-visibility", async () => {
-    // Design §6.3 (P1): the v3 data-plane proof the v1 scenarios above cannot
-    // give — everything lands in the MAIN store (v3 never touches the
-    // per-user physical cores), so isolation is carried purely by the
-    // subsume-normalized columns:
-    //   - write gate: /v3/conversation/add without user_id → 400 (§4.2(b))
-    //   - L0/L1 rows carry team_id = user_id (subsume columns)
-    //   - after real L1 extraction, the L2 task keys land as
-    //     profile:team:{uid}|agent:default|session:… in the checkpoint —
-    //     the §2.1 seam-1 end-to-end proof (L2 requery parses team:{uid}
-    //     and that column EXISTS on the L1 rows)
-    //   - /v3/conversation/search per user: own tokens visible, the other
-    //     user's L0-only tokens invisible
-    const mock = await startMockLlmServer();
-    const gw = await startGateway({
-      port: PORT_V3_SUBSUME,
-      multiUser: true,
-      extraEnv: {
-        TDAI_LLM_BASE_URL: mock.baseUrl,
-        TDAI_LLM_API_KEY: "test-key",
-        TDAI_LLM_MODEL: "mock",
-      },
-      gatewayConfigFile: {
-        memory: { pipeline: { enableWarmup: false, everyNConversations: 2 } },
-      },
-    });
+  it("v3 per-user stores: user writes land in users/<uid>/vectors.db and stay cross-invisible; default writes 400; owner stays in main", async () => {
+    const gw = await startGateway({ port: PORT_V3_STORES, multiUser: true, ownerUserIds: ["ops-admin"] });
     dumpLogsOnFailure(gw);
 
-    // v3 数据面按 serviceId 走 store pool 实例路由（standalone 也是）：
-    // L0/L1 行落在 dataDir/instances/{serviceId}/vectors.db，主库不经手。
-    const instanceDb = path.join(gw.dataDir, "instances", "e2e-test-svc", "vectors.db");
-    // v3 auth contract: every /v2|/v3 request needs Bearer + x-tdai-service-id
-    // (v2-router resolveAuthContext) — the plugin client always sends both.
-    const v3Headers = { authorization: "Bearer e2e-test", "x-tdai-service-id": "e2e-test-svc" };
-    const v3Add = (userId: string, session: string, userText: string) =>
+    // The live plugin's shape: Bearer + x-tdai-service-id "default", placeholder team.
+    const v3Headers = { authorization: "Bearer e2e-test", "x-tdai-service-id": "default" };
+    const v3Add = (userId: string | null, session: string, userText: string) =>
       postJson<{ code: number; message?: string }>(gw.baseUrl, "/v3/conversation/add", {
-        // Plugin shape: placeholder team + real user — subsume rewrites the team.
         team_id: "default",
         agent_id: "default",
-        user_id: userId,
+        ...(userId !== null ? { user_id: userId } : {}),
         session_id: session,
         messages: [{ role: "user", content: userText }, { role: "assistant", content: `ack ${session}` }],
       }, v3Headers);
@@ -952,75 +970,156 @@ describeRealGateway("gateway multi-user e2e (real subprocess + HTTP)", () => {
       expect(json.code).toBe(0);
       return json.data?.messages?.length ?? 0;
     };
+    const userDb = (uid: string) => path.join(gw.dataDir, "users", uid, "vectors.db");
+    const mainDb = path.join(gw.dataDir, "vectors.db");
 
     try {
-      // ── §4.2(b) write gate: identity-less add is rejected, nothing lands ──
-      const gated = await postJson<{ code: number; message?: string }>(gw.baseUrl, "/v3/conversation/add", {
-        team_id: "default", agent_id: "default", session_id: "sess-gate",
-        messages: [{ role: "user", content: "no identity" }],
-      }, v3Headers);
+      // ── default-identity write is rejected; nothing lands anywhere ──
+      const gated = await v3Add(null, "sess-gate", "no identity");
       expect(gated.status).toBe(400);
       expect(gated.json.message ?? "").toContain("user_id");
-      expect(await sqliteQuery(instanceDb, "SELECT COUNT(*) AS n FROM l0_conversations WHERE session_id = ?", "sess-gate"))
-        .toEqual([{ n: 0 }]);
-
-      // ── dual-user v3 adds (2 rounds each → fixed L1 threshold 2) ──
-      for (let round = 1; round <= 2; round++) {
-        const addA = await v3Add("a", "sess-v3-a", `round ${round} for a: the raven ledger is kept in the attic`);
-        expect(addA.status).toBe(200);
-        const addB = await v3Add("b", "sess-v3-b", `round ${round} for b: the falcon manifest is filed at noon`);
-        expect(addB.status).toBe(200);
-      }
-
-      // ── subsume columns on L0 (main store, not per-user dirs) ──
-      const l0Teams = await pollSqlite(
-        instanceDb,
-        async () => await sqliteQuery<{ session_id: string; team_id: string; user_id: string }>(
-          instanceDb, "SELECT session_id, team_id, user_id FROM l0_conversations WHERE session_id IN (?, ?)", "sess-v3-a", "sess-v3-b"),
-        (rows) => rows.length >= 4 && rows.every((r) => r.team_id === r.user_id),
-      );
-      expect(new Set(l0Teams.map((r) => r.user_id))).toEqual(new Set(["a", "b"]));
-      // v3 数据面从不创建 per-user 物理 core 目录
       expect(fs.existsSync(path.join(gw.dataDir, "users"))).toBe(false);
 
-      // ── real L1 extraction → subsume columns on L1 ──
-      await pollSqlite(
-        instanceDb,
-        async () => await sqliteQuery<{ team_id: string; user_id: string }>(
-          instanceDb, "SELECT team_id, user_id FROM l1_records WHERE session_key IN (?, ?)", "sess-v3-a", "sess-v3-b"),
-        (rows) => rows.length > 0 && rows.every((r) => r.team_id === r.user_id && r.team_id !== "default"),
-      );
-      expect(mock.requestCount()).toBeGreaterThan(0);
+      // ── two users, two rounds each; plus the owner ──
+      const users = [
+        { uid: "a", session: "sess-v3-a", token: "raven ledger" },
+        { uid: "b", session: "sess-v3-b", token: "falcon manifest" },
+      ] as const;
+      for (const { uid, session, token } of users) {
+        for (let round = 1; round <= 2; round++) {
+          const r = await v3Add(uid, session, `round ${round} for ${uid}: the ${token} is kept in the attic`);
+          expect(r.status, `add ${uid} round ${round}`).toBe(200);
+        }
+      }
+      const owner = await v3Add("ops-admin", "sess-v3-owner", "owner round: the heron ledger is kept in the attic");
+      expect(owner.status).toBe(200);
 
-      // ── §2.1 seam-1 端到端：真实 L2 运行把 per-user profile 存储域目录
-      // 落到磁盘（profiles/team:{uid}|agent:default/ —— core_read/scenario_ls
-      // 服务的就是这里；L2 任务键 profile:team:{uid}|agent:default|session:…
-      // 见子进程遥测 trace）。stateful 管线的 pipeline_states 不在 root
-      // checkpoint 文件里，磁盘目录是可轮询的权威落点。
-      const userScopeDir = (uid: string) =>
-        path.join(gw.dataDir, "profiles", encodeURIComponent(`team:${uid}|agent:default`));
-      await pollUntil(
-        () => fs.existsSync(userScopeDir("a")) && fs.existsSync(userScopeDir("b")),
-        L1_EXTRACTION_TIMEOUT_MS,
-        "per-user profile scope dirs profiles/team:{a,b}|agent:default on disk",
-      );
+      // ── physical layout: one database per user under users/<uid>/ ──
+      expect(fs.existsSync(userDb("a"))).toBe(true);
+      expect(fs.existsSync(userDb("b"))).toBe(true);
+      expect(fs.existsSync(path.join(gw.dataDir, "users", "ops-admin"))).toBe(false);
 
-      // ── v3 read surface: own tokens visible, other user's L0-only tokens invisible ──
-      await pollUntil(
-        async () => (await v3ConvSearch("raven ledger", "a")) > 0,
-        SEARCH_VISIBLE_TIMEOUT_MS,
-        "user a sees own conversation via /v3/conversation/search",
-      );
+      // ── column-level: rows keep the plugin's team_id and carry the uid ──
+      const aCols = await sqliteQuery<{ team_id: string; user_id: string }>(userDb("a"), "SELECT DISTINCT team_id, user_id FROM l0_conversations");
+      expect(aCols).toEqual([{ team_id: "default", user_id: "a" }]);
+      expect(await countRows(userDb("a"), "l0_conversations", ["sess-v3-a"])).toBe(4);
+      expect(await countRows(userDb("a"), "l0_conversations", ["sess-v3-b"])).toBe(0);
+      expect(await countRows(userDb("b"), "l0_conversations", ["sess-v3-a"])).toBe(0);
+      // the main store holds the owner's rows only
+      expect(await countRows(mainDb, "l0_conversations", ["sess-v3-a", "sess-v3-b"])).toBe(0);
+      expect(await countRows(mainDb, "l0_conversations", ["sess-v3-owner"])).toBe(2);
+
+      // ── JSONL mirrors follow the store root ──
+      const userMirror = readAllJsonl(path.join(gw.dataDir, "users", "a", "conversations"));
+      const mainMirror = readAllJsonl(path.join(gw.dataDir, "conversations"));
+      expect(userMirror).toContain("sess-v3-a");
+      expect(userMirror).not.toContain("sess-v3-b");
+      expect(mainMirror).not.toContain("sess-v3-a");
+      expect(mainMirror).toContain("sess-v3-owner");
+
+      // ── read surface: own tokens visible, the other user's invisible ──
+      await pollUntil(async () => (await v3ConvSearch("raven ledger", "a")) > 0, SEARCH_VISIBLE_TIMEOUT_MS, "user a sees own conversation");
       expect(await v3ConvSearch("falcon manifest", "a")).toBe(0);
-      await pollUntil(
-        async () => (await v3ConvSearch("falcon manifest", "b")) > 0,
-        SEARCH_VISIBLE_TIMEOUT_MS,
-        "user b sees own conversation via /v3/conversation/search",
-      );
+      await pollUntil(async () => (await v3ConvSearch("falcon manifest", "b")) > 0, SEARCH_VISIBLE_TIMEOUT_MS, "user b sees own conversation");
       expect(await v3ConvSearch("raven ledger", "b")).toBe(0);
+
+      // ── the reserved prefix cannot address another user's store ──
+      const forged = await postJson<{ code: number; message?: string }>(gw.baseUrl, "/v3/conversation/search",
+        { team_id: "default", agent_id: "default", user_id: "a", query: "raven ledger", limit: 20 },
+        { authorization: "Bearer e2e-test", "x-tdai-service-id": "user:b" });
+      expect(forged.status).toBe(400);
+
+      // ── …and not via the offload routes either (review I2): they dispatch
+      //    before handleV2Route through their own parseV2Auth — the
+      //    request-router-level guard (Task 4 Step 7(f)) is what closes them ──
+      const offloadForged = await postJson<{ code: number; message?: string }>(gw.baseUrl, "/v2/offload/query-mmd",
+        { session_id: "sess-v3-a" },
+        { authorization: "Bearer e2e-test", "x-tdai-service-id": "user:b" });
+      expect(offloadForged.status).toBe(400);
+    } finally {
+      await gw.stop();
+    }
+  });
+
+  it("v3 per-user pipeline: L1 lands in the user's store, the profile scope dir sits under the user dir, L1 runs with the chat prompt family", async () => {
+    const mock = await startMockLlmServer();
+    const gw = await startGateway({
+      port: PORT_V3_PIPELINE,
+      multiUser: true,
+      ownerUserIds: ["ops-admin"],
+      userPromptMode: "chat",
+      extraEnv: {
+        TDAI_LLM_BASE_URL: mock.baseUrl,
+        TDAI_LLM_API_KEY: "test-key",
+        TDAI_LLM_MODEL: "mock",
+      },
+      // The global family stays "code" (the live config): only user-scoped
+      // runs must flip to chat. Fixed L1 threshold 2 — see the v1 L1 test above.
+      gatewayConfigFile: {
+        memory: { promptMode: "code", pipeline: { enableWarmup: false, everyNConversations: 2 } },
+      },
+    });
+    dumpLogsOnFailure(gw);
+
+    const v3Headers = { authorization: "Bearer e2e-test", "x-tdai-service-id": "default" };
+    const v3Add = (userId: string, session: string, userText: string) =>
+      postJson<{ code: number; message?: string }>(gw.baseUrl, "/v3/conversation/add", {
+        team_id: "default", agent_id: "default", user_id: userId, session_id: session,
+        messages: [{ role: "user", content: userText }, { role: "assistant", content: `ack ${session}` }],
+      }, v3Headers);
+    const userDb = (uid: string) => path.join(gw.dataDir, "users", uid, "vectors.db");
+    const scopeDir = (root: string) => path.join(root, "profiles", encodeURIComponent("team:default|agent:default"));
+    const pollWithLogs = async (what: string, predicate: () => Promise<boolean>) => {
+      try {
+        await pollUntil(predicate, L1_EXTRACTION_TIMEOUT_MS, what);
+      } catch (err) {
+        throw new Error(`${err instanceof Error ? err.message : String(err)}\n${gw.dumpLogs()}`);
+      }
+    };
+
+    try {
+      for (let round = 1; round <= 2; round++) {
+        expect((await v3Add("a", "sess-v3-a", `round ${round} for a: the raven ledger is kept in the attic`)).status).toBe(200);
+        expect((await v3Add("b", "sess-v3-b", `round ${round} for b: the falcon manifest is filed at noon`)).status).toBe(200);
+      }
+
+      // ── the real extraction pipeline landed L1 in each user's own database ──
+      await pollWithLogs("l1_records row for user a in users/a/vectors.db",
+        async () => (await countRows(userDb("a"), "l1_records", ["sess-v3-a"])) > 0);
+      await pollWithLogs("l1_records row for user b in users/b/vectors.db",
+        async () => (await countRows(userDb("b"), "l1_records", ["sess-v3-b"])) > 0);
+      expect(mock.requestCount()).toBeGreaterThan(0);
+      // hard regression lock: no user's L1 in the other user's store or in the main store
+      expect(await countRows(userDb("a"), "l1_records", ["sess-v3-b"])).toBe(0);
+      expect(await countRows(userDb("b"), "l1_records", ["sess-v3-a"])).toBe(0);
+      expect(await countRows(path.join(gw.dataDir, "vectors.db"), "l1_records", ["sess-v3-a", "sess-v3-b"])).toBe(0);
+
+      // ── the profile scope lives under the user's directory, not under the root ──
+      await pollWithLogs("profile scope dir under users/a and users/b",
+        async () => fs.existsSync(scopeDir(path.join(gw.dataDir, "users", "a")))
+          && fs.existsSync(scopeDir(path.join(gw.dataDir, "users", "b"))));
+      expect(fs.existsSync(scopeDir(gw.dataDir))).toBe(false);
+
+      // ── prompt family: user-scoped L1 ran with the chat prompt, never the work-memory one ──
+      const prompts = mock.systemPrompts();
+      expect(prompts.some((p) => p.includes("分析用户的对话"))).toBe(true);
+      expect(prompts.some((p) => p.includes("分析多人工作消息"))).toBe(false);
     } finally {
       await gw.stop();
       await mock.close();
     }
+  });
+
+  it("service mode + multiUser.enabled refuses to boot (start() wiring, design §6.6)", async () => {
+    // The guard must be wired as the FIRST statement of start() so a wrong
+    // combination fails at boot, not on the first request (review I5: no unit
+    // test ever calls start()). startGateway waits for /health and rejects
+    // with the child's logs when the child exits early — which is exactly the
+    // boot-refusal outcome pinned here. The failed child never binds a port.
+    await expect(startGateway({
+      port: PORT_V3_BOOT_REFUSAL,
+      multiUser: true,
+      gatewayConfigFile: { deployMode: "service" },
+    })).rejects.toThrow(/multiUser\.enabled requires deployMode=standalone/);
   });
 });
