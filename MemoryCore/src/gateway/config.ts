@@ -13,7 +13,7 @@ import path from "node:path";
 import YAML from "yaml";
 import { getEnv } from "../utils/env.js";
 import { parseConfig as parseMemoryConfig } from "../config.js";
-import type { MemoryTdaiConfig } from "../config.js";
+import type { MemoryPromptMode, MemoryTdaiConfig } from "../config.js";
 import { normalizeUserId } from "../utils/user-id.js";
 import type { StandaloneLLMConfig } from "../adapters/standalone/llm-runner.js";
 
@@ -380,6 +380,16 @@ export interface GatewayConfig {
      * yaml: `multiUser.ownerUserIds` (string[] or comma-separated string)
      */
     ownerUserIds: string[];
+    /**
+     * Prompt family for user-scoped stores (`users/<uid>/`): applies to L1
+     * extraction + dedup, L2 scenes and the L3 persona of per-user runs.
+     * Unset → the global `memory.promptMode` / group overrides apply.
+     * (docs/per-user-stores-v3-design.md §8)
+     *
+     * env: `TDAI_MULTI_USER_PROMPT_MODE` (`chat` | `code`)
+     * yaml: `multiUser.userPromptMode`
+     */
+    userPromptMode?: MemoryPromptMode;
   };
 
   /**
@@ -1166,7 +1176,29 @@ function resolveMultiUser(src: Record<string, unknown>): GatewayConfig["multiUse
     ownerUserIds.push(normalized);
   }
 
-  return { enabled, ownerUserIds: [...new Set(ownerUserIds)] };
+  // 4. userPromptMode — env first (scalar precedence, like enabled). An invalid
+  //    value is dropped with a stderr WARN (operator typo visibility); the raw
+  //    value is not echoed.
+  const rawMode = env("TDAI_MULTI_USER_PROMPT_MODE")
+    ?? (typeof src["userPromptMode"] === "string" ? src["userPromptMode"] : undefined);
+  let userPromptMode: MemoryPromptMode | undefined;
+  if (rawMode !== undefined) {
+    const normalized = rawMode.trim().toLowerCase();
+    if (normalized === "chat" || normalized === "code") {
+      userPromptMode = normalized;
+    } else {
+      process.stderr.write(
+        `[tdai-gateway] WARN: ignoring invalid multiUser.userPromptMode (expected "chat" or "code")\n`,
+      );
+    }
+  }
+
+  return {
+    enabled,
+    ownerUserIds: [...new Set(ownerUserIds)],
+    // Key omitted (not `undefined`) so `toEqual` and `"key" in obj` stay clean.
+    ...(userPromptMode ? { userPromptMode } : {}),
+  };
 }
 
 /**
@@ -1199,4 +1231,23 @@ function expandEnvVars(value: unknown): unknown {
     return out;
   }
   return value;
+}
+
+/**
+ * Per-user stores (`multiUser.enabled`) exist only for the standalone layout:
+ * the service (multi-instance) mode resolves stores through remote instance
+ * pools and has no `users/<uid>/` concept. Called at the top of
+ * `TdaiGateway.start()` so a wrong combination fails at boot, not on the first
+ * request (docs/per-user-stores-v3-design.md §6.6).
+ */
+export function assertMultiUserLayout(
+  deployMode: GatewayConfig["deployMode"],
+  multiUser: GatewayConfig["multiUser"],
+): void {
+  if (multiUser.enabled && deployMode === "service") {
+    throw new Error(
+      "[gateway] multiUser.enabled requires deployMode=standalone: per-user stores under users/<uid>/ " +
+      "are not implemented for the service (multi-instance) layout",
+    );
+  }
 }

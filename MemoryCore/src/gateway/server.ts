@@ -22,7 +22,7 @@ import zlib from "node:zlib";
 import dayjs from "dayjs";
 import { TdaiCore } from "../core/tdai-core.js";
 import { StandaloneHostAdapter } from "../adapters/standalone/host-adapter.js";
-import { loadGatewayConfig, parseBrokers } from "./config.js";
+import { assertMultiUserLayout, loadGatewayConfig, parseBrokers } from "./config.js";
 import type { GatewayConfig, GatewayConfigOverrides } from "./config.js";
 import { dbChoiceToStoreConfigs, LocalBackendResolver } from "../core/backend-selection/index.js";
 import type { BackendResolver } from "../core/backend-selection/index.js";
@@ -723,6 +723,8 @@ export class TdaiGateway {
    * Start the Gateway HTTP server.
    */
   async start(): Promise<void> {
+    assertMultiUserLayout(this.config.deployMode, this.config.multiUser);
+
     // Initialize data directories
     initDataDirectories(this.config.data.baseDir);
 
@@ -858,7 +860,8 @@ export class TdaiGateway {
     if (this.config.multiUser.enabled) {
       this.logger.info(
         `Multi-user routing ENABLED: owners=${this.config.multiUser.ownerUserIds.length}, ` +
-        `maxUserCores=${MAX_USER_CORES}, layout=<baseDir>/users/<uid>/`,
+        `maxUserCores=${MAX_USER_CORES}, layout=<baseDir>/users/<uid>/, ` +
+        `v3=per-user-stores, userPromptMode=${this.config.multiUser.userPromptMode ?? "(global)"}`,
       );
     }
 

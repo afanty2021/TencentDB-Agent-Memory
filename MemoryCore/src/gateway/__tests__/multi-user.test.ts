@@ -6,7 +6,7 @@ import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseConfig } from "../../config.js";
 import type { MemoryTdaiConfig } from "../../config.js";
 import { TdaiCore } from "../../core/tdai-core.js";
-import { loadGatewayConfig } from "../config.js";
+import { assertMultiUserLayout, loadGatewayConfig } from "../config.js";
 import type { GatewayConfig } from "../config.js";
 import { TdaiGateway } from "../server.js";
 import { applyMultiUserV3Routing, type V3IsolationCtx } from "../v2-router.js";
@@ -40,6 +40,7 @@ beforeEach(() => {
   vi.stubEnv("TDAI_DATA_DIR", path.join(tmpRoot, "data"));
   delete process.env.TDAI_MULTI_USER;
   delete process.env.TDAI_MULTI_USER_OWNERS;
+  delete process.env.TDAI_MULTI_USER_PROMPT_MODE;
 
   // Mute the gateway's console logger to keep test output pristine; the warn
   // spy stays observable so tests can assert on normalization rejections.
@@ -157,6 +158,44 @@ describe("multiUser config loading", () => {
     const cfg = loadGatewayConfig({ multiUser: { enabled: true, ownerUserIds: ["a_b"] } });
     expect(cfg.multiUser).toEqual({ enabled: true, ownerUserIds: ["a_b"] });
     expect(cfg.data.baseDir).toBeTruthy(); // sibling fields survive the merge
+  });
+
+  it("leaves userPromptMode unset by default", () => {
+    expect(loadGatewayConfig().multiUser).toEqual({ enabled: false, ownerUserIds: [] });
+    expect("userPromptMode" in loadGatewayConfig().multiUser).toBe(false);
+  });
+
+  it("reads userPromptMode from yaml and from TDAI_MULTI_USER_PROMPT_MODE (env wins)", () => {
+    fs.writeFileSync(
+      path.join(tmpRoot, "gateway.yaml"),
+      ["multiUser:", "  enabled: true", "  userPromptMode: chat"].join("\n"),
+    );
+    vi.stubEnv("TDAI_GATEWAY_CONFIG", path.join(tmpRoot, "gateway.yaml"));
+    expect(loadGatewayConfig().multiUser.userPromptMode).toBe("chat");
+
+    vi.stubEnv("TDAI_MULTI_USER_PROMPT_MODE", "code");
+    expect(loadGatewayConfig().multiUser.userPromptMode).toBe("code");
+  });
+
+  it("ignores an invalid userPromptMode with a stderr WARN (the global prompt family then applies)", () => {
+    vi.stubEnv("TDAI_MULTI_USER_PROMPT_MODE", "teamwork");
+    const cfg = loadGatewayConfig();
+    expect(cfg.multiUser.userPromptMode).toBeUndefined();
+    expect("userPromptMode" in cfg.multiUser).toBe(false);
+    const warn = stderrSpy.mock.calls.find((call) => String(call[0]).includes("invalid multiUser.userPromptMode"));
+    expect(warn).toBeTruthy();
+    expect(String(warn![0])).not.toContain("teamwork");
+  });
+});
+
+describe("assertMultiUserLayout", () => {
+  it("accepts standalone, and service while the feature is off", () => {
+    expect(() => assertMultiUserLayout("standalone", { enabled: true, ownerUserIds: [] })).not.toThrow();
+    expect(() => assertMultiUserLayout("service", { enabled: false, ownerUserIds: [] })).not.toThrow();
+  });
+
+  it("refuses multiUser.enabled in service mode (per-user stores are standalone-only)", () => {
+    expect(() => assertMultiUserLayout("service", { enabled: true, ownerUserIds: [] })).toThrow(/deployMode=standalone/);
   });
 });
 
