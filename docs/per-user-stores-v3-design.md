@@ -16,7 +16,7 @@
 | 代 | 时期 | 方式 | 按人画像 |
 |---|---|---|---|
 | Gen A | 06-18→09-15 | 单库单人 | 有（管理员本人） |
-| Gen B | 09-15→约 09-20（数据写到 09-29） | 物理路由：每人一整套独立库 `users/<uid>/` | 有（`users/教师 A/persona.md` 等 3 份遗存） |
+| Gen B | 09-15→约 09-20（数据写到 09-29） | 物理路由：每人一整套独立库 `users/<uid>/` | 有（教师 A 目录下 `persona.md` 等 3 份遗存） |
 | Gen C | 10-25→今 | MemoryCore 共享库 + 列隔离；L2/L3 作用域有意忽略 userId | 无（全员共用一份 "Team Operating Doctrine"） |
 
 ### 1.2 关键事实：物理隔离机制已经在仓里，只差 v3 没接
@@ -38,9 +38,9 @@ standalone 模式下「库在哪」只由两个点决定，且都以 `instanceId
 
 ### 1.4 现状数据（2026-11-26 只读对账，时间为 UTC）
 
-主库 `l0_conversations` 722 行 / `l1_records` 596 行：
+主库 `l0_conversations` 722 行 / `l1_records` 596 行。教师一律以代称记（教师 A–F，全文同此）；示意里的路径与实例号写作 `<uid>`；对照表自留本地、不入仓（§15）。
 
-| user_id | L0 | L1 | 说明 |
+| user_id（教师为代称） | L0 | L1 | 说明 |
 |---|---|---|---|
 | default | 396 | 400 | cron 会话 + 单用户时代历史，无真人对话 |
 | huangzhengbo | 236 | 125 | 管理员（owner），1 个长会话 |
@@ -51,7 +51,7 @@ standalone 模式下「库在哪」只由两个点决定，且都以 `instanceId
 
 `users/` 下的 Gen B 遗留目录：
 
-| uid | L0 | L1 | 旧画像 | 备注 |
+| uid（教师为代称） | L0 | L1 | 旧画像 | 备注 |
 |---|---|---|---|---|
 | 教师 A | 61 | 3 | 有（3801 B，09-21） | 另有 2 个旧场景块 |
 | 教师 E | 14 | 4 | 有 | 10-25 后未再出现 |
@@ -205,19 +205,19 @@ live 读的是仓内 `MemoryCore/tdai-gateway.yaml`（网关进程 CWD 优先于
 ## 7. 数据流
 
 ```
-Hermes 轮次（教师 教师 A）
-  └─ 插件 POST /v3/conversation/add {user_id:"教师 A", team_id:"default", agent_id:"default"}
+Hermes 轮次（教师 A；`<uid>` 指其归一化后的 uid）
+  └─ 插件 POST /v3/conversation/add {user_id:"<uid>", team_id:"default", agent_id:"default"}
        │
   handleV2Route
-    ├─ 读请求体 → 归一化 → routeV3ByUser → 用户库，实例号 user:教师 A
-    ├─ resolveStore(user:教师 A)   → StorePool → users/教师 A/vectors.db
-    ├─ resolveStorage(user:教师 A) → users/教师 A/
-    └─ notifyPipeline(user:教师 A, session, rounds, "default", "default")
+    ├─ 读请求体 → 归一化 → routeV3ByUser → 用户库，实例号 user:<uid>
+    ├─ resolveStore(user:<uid>)   → StorePool → users/<uid>/vectors.db
+    ├─ resolveStorage(user:<uid>) → users/<uid>/
+    └─ notifyPipeline(user:<uid>, session, rounds, "default", "default")
             │
   StatefulPipelineManager → state backend → PipelineWorker
-    └─ executeL1/L2/L3：按 task.instanceId=user:教师 A 取库/目录，RunScope.dataDir=users/教师 A
-         ├─ L1：L0 抽成 L1，写 users/教师 A/vectors.db；游标在 users/教师 A/.metadata/
-         ├─ L2：场景块落 users/教师 A/profiles/team%3Adefault%7Cagent%3Adefault/
+    └─ executeL1/L2/L3：按 task.instanceId=user:<uid> 取库/目录，RunScope.dataDir=users/<uid>
+         ├─ L1：L0 抽成 L1，写 users/<uid>/vectors.db；游标在 users/<uid>/.metadata/
+         ├─ L2：场景块落 users/<uid>/profiles/team%3Adefault%7Cagent%3Adefault/
          └─ L3：画像落同目录 persona.md
 ```
 
@@ -277,7 +277,7 @@ node --import tsx scripts/import-per-user-stores.ts --data-dir <baseDir> [--owne
 
 **预期结果（2026-11-26 数据）**：
 
-| uid | 复制 L0/L1 | 改挂 L0/L1 |
+| uid（教师为代称，见 §1.4） | 复制 L0/L1 | 改挂 L0/L1 |
 |---|---|---|
 | 教师 A | +50 / +44 | 61 / 3（旧库原地升级） |
 | 教师 B | +32 / +22 | 14 / 0（旧库原地升级） |
@@ -288,7 +288,7 @@ node --import tsx scripts/import-per-user-stores.ts --data-dir <baseDir> [--owne
 
 `zz-encourage` 无库，不动。旧位置的人物画像与场景块文件留在原地，新引擎不读。
 
-**已知效应**：续聊的旧会话（如 教师 B 那个 10-27 起的长会话）在新的用户库里没有游标，L1 会从会话头开始再抽一遍，由去重环节与已导入的 L1 合并。这与今天丢失 checkpoint 后的行为相同。
+**已知效应**：续聊的旧会话（如教师 B 那个 10-27 起的长会话）在新的用户库里没有游标，L1 会从会话头开始再抽一遍，由去重环节与已导入的 L1 合并。这与今天丢失 checkpoint 后的行为相同。
 
 ## 10. 被取代的部分
 
@@ -308,7 +308,7 @@ v1 协议的按人 core 路径及其 11 条单测原样保留。
 
 ## 11. 安全边界
 
-- **保留前缀**：`x-tdai-service-id` 的值只校验非空（`parseV2Auth`，`v2-router.ts:440`），客户端可以自己填 `user:教师 A` 去指到别人的库。因此该头以 `user:` 开头一律 400，与开关状态无关。用户域实例号只能由网关内部根据归一化后的 `user_id` 构造。
+- **保留前缀**：`x-tdai-service-id` 的值只校验非空（`parseV2Auth`，`v2-router.ts:440`），客户端可以自己填 `user:<uid>` 去指到别人的库。因此该头以 `user:` 开头一律 400，与开关状态无关。用户域实例号只能由网关内部根据归一化后的 `user_id` 构造。
 - **目录穿越**：uid 必须匹配 `^[a-z0-9_-]{1,64}$` 才会被拼进路径；`buildUserScopeInstanceId` 对非法 uid 抛错；`LocalStorageBackend` 另有根目录逃逸检查。
 - **信任边界同 09-14**：网关绑定 127.0.0.1，本方案防用户之间串库，不防持有网关密钥的本地进程——`user_id` 是调用方自声明字段，持钥者本来就能冒充任意 uid。
 - **日志**：uid 是标识符，可以进日志；记忆内容、查询文本不进日志（现有约定）。
@@ -339,7 +339,7 @@ v1 协议的按人 core 路径及其 11 条单测原样保留。
 | 导入 CLI（真脚本子进程） | `--confirm` 无有效 `--owners` 时 stderr 告警；全由非法条目组成的 `--owners` 视同没有；自检不通过时退出码 1 并报出全文索引计数 |
 | executor | 用户域 flush 任务不触达主 core 的 `handleSessionEnd`（warn 后返回）；主库实例的 flush 照常 |
 
-旧 schema 夹具：取 `users/教师 A/vectors.db` 的 `sqlite_master` DDL（仅结构，无数据）作为测试夹具。
+旧 schema 夹具：取教师 A 旧库（`users/<uid>/vectors.db`）的 `sqlite_master` DDL（仅结构，无数据）作为测试夹具。
 
 **e2e**（真实网关，隔离端口 + 临时目录 + mock LLM，沿用现有 `gateway.multi-user.e2e.test.ts` 的基建）
 
@@ -349,7 +349,7 @@ v1 协议的按人 core 路径及其 11 条单测原样保留。
 
 **副本演练**（上 live 前的必经步骤，不属于自动化测试）
 
-复制 live 存储 → 导入 dry-run / confirm → 测试网关开 `multiUser` 跑读写矩阵 → 核对 §9 预期表、旧 教师 A 库升级后 9 月的行能被 教师 A 身份检索到、管线产物落在本人目录。隔离手法与 11-26 演练相同（独立 `TDAI_DATA_DIR`、独立端口、LLM 指向空地址、`lsof` 核对测试进程对 live 存储零句柄）。
+复制 live 存储 → 导入 dry-run / confirm → 测试网关开 `multiUser` 跑读写矩阵 → 核对 §9 预期表、教师 A 的旧库升级后 9 月的行能以教师 A 身份检索到、管线产物落在本人目录。隔离手法与 11-26 演练相同（独立 `TDAI_DATA_DIR`、独立端口、LLM 指向空地址、`lsof` 核对测试进程对 live 存储零句柄）。
 
 ## 13. 上线与回滚
 
@@ -361,7 +361,7 @@ v1 协议的按人 core 路径及其 11 条单测原样保留。
 4. 改仓内 `MemoryCore/tdai-gateway.yaml`：`multiUser.enabled: true`、`ownerUserIds: [huangzhengbo]`、`userPromptMode: chat`；提交。同时核对 `observability` 块保持全关（§11 遥测面：开启后搜索的查询原文与命中内容会随 span 外发）。
 5. 重启网关：结束 8420 监听进程，由插件监督器重拉（配置是网关侧读的，Hermes 不必重启）。避开周日 19:00–20:00 周报窗与 05:00 / 08:00 的 cron。
 6. 补跑一次导入（`--owners` 同第 2 步；幂等），收掉第 3 步到第 5 步之间的增量。此时开关已开、网关在写用户库，而每次 confirm 都会对每个用户库重建一次全文索引：自检的索引行数对账若恰好撞上同一用户库的并发写入，可能因多出一条重复索引行而报不通过——重跑一次即重建并通过（此为代码分析所得，未实测）。
-7. 验收：网关日志出现 `Multi-user routing ENABLED … layout=<baseDir>/users/<uid>/`；以 教师 A 身份读能检索到 9 月与 10 月的行、画像为空；以 default 身份写被 400；下一场 cron 的 agent.log 出现 `sync failed: HTTP Error 400` 且任务照常完成。
+7. 验收：网关日志出现 `Multi-user routing ENABLED … layout=<baseDir>/users/<uid>/`；以教师 A 身份读能检索到 9 月与 10 月的行、画像为空；以 default 身份写被 400；下一场 cron 的 agent.log 出现 `sync failed: HTTP Error 400` 且任务照常完成。
 
 ### 13.2 回滚
 
@@ -407,3 +407,4 @@ v1 协议的按人 core 路径及其 11 条单测原样保留。
 | 2026-11-27 | 设计（方案 A，§1–§13）认可 | 用户 |
 | 2026-11-27 | owner 留在主库 | 沿用 09-14 评审决策 1，本次设计评审未提异议 |
 | 2026-11-27 | `/v3/chat-memory/clear` 的 `user_ids` 模式下线 | 本文档提出，属已认可的设计范围；已随实施落地（8c97ac6），三席评审无异议 |
+| 2026-11-28 | 全文的教师 uid 改为代称（推送前脱敏） | 用户（11-28 分支评审 P1）；对照表自留本地不入仓；管理员 id 与测试账号不代称化 |
