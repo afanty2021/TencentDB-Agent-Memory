@@ -20,7 +20,7 @@ import { URL } from "node:url";
 import { timingSafeEqual } from "node:crypto";
 import zlib from "node:zlib";
 import dayjs from "dayjs";
-import { TdaiCore } from "../core/tdai-core.js";
+import { TdaiCore, type RunScope } from "../core/tdai-core.js";
 import { StandaloneHostAdapter } from "../adapters/standalone/host-adapter.js";
 import { assertMultiUserLayout, loadGatewayConfig, parseBrokers } from "./config.js";
 import type { GatewayConfig, GatewayConfigOverrides } from "./config.js";
@@ -3117,6 +3117,30 @@ export class TdaiGateway {
     };
 
     /**
+     * Per-run scope for a task's instance (docs/per-user-stores-v3-design.md §6.5, §8).
+     *
+     * A user-scoped instance (`user:<uid>`) runs against the user's own data
+     * directory. When `multiUser.userPromptMode` is set, that family is applied
+     * to BOTH groups — L1 extraction + dedup read `extraction.promptMode`, L2
+     * scenes and the L3 persona read `persona.promptMode`; the two families
+     * are not meant to be mixed (the persona is built from the scene blocks).
+     * Main-instance tasks get no scope.
+     */
+    const resolveRunScope = (instanceId: string): RunScope | undefined => {
+      const root = resolveScopeDataRoot(gateway.config.data.baseDir, instanceId);
+      if (!root.scoped) return undefined;
+      const userMode = gateway.config.multiUser.userPromptMode;
+      const cfg = userMode
+        ? {
+            ...gateway.config.memory,
+            extraction: { ...gateway.config.memory.extraction, promptMode: userMode },
+            persona: { ...gateway.config.memory.persona, promptMode: userMode },
+          }
+        : undefined;
+      return { dataDir: root.dataDir, cfg };
+    };
+
+    /**
      * 构造 checkpoint 的跨节点互斥锁。
      *
      * 为什么必需：同一 instance 的 checkpoint 是**同一个** COS 对象
@@ -3204,6 +3228,7 @@ export class TdaiGateway {
           embedding,
           storage ?? undefined,
           resolveCheckpointLock(instanceId),
+          resolveRunScope(instanceId),
         );
 
         (task as any)._l2ProfileScopes = result.profileScopes;
@@ -3280,7 +3305,7 @@ export class TdaiGateway {
           } catch { /* ok */ }
         }
 
-        const result = await core.runL2WithStore(task.sessionId, store, storage ?? undefined, cursor);
+        const result = await core.runL2WithStore(task.sessionId, store, storage ?? undefined, cursor, resolveRunScope(instanceId));
 
         // Mark task as skipped if L2 had no new records to process
         if (result.skipped) {
@@ -3334,7 +3359,7 @@ export class TdaiGateway {
 
         core.setInstanceId(instanceId);
         const { store } = await resolveStore(task);
-        const result = await core.runL3WithStore(store, storage ?? undefined);
+        const result = await core.runL3WithStore(store, storage ?? undefined, resolveRunScope(instanceId));
 
         // Report credit + memory (only +1 on first persona creation)
         // provider=proxy 模式下 credit 由 context_proxy 上报，此处仅报 memory delta。

@@ -12,6 +12,20 @@ import { TdaiGateway } from "../server.js";
 import { handleV2Route, routeV3ByUser } from "../v2-router.js";
 import { makeChatMemoryRouteTable } from "../chat-memory-handlers.js";
 import { StorageAdapter } from "../../core/storage/adapter.js";
+import { createL1Runner, createL2Runner, createL3Runner } from "../../utils/pipeline-factory.js";
+
+// ── RunScope pins ──
+// tdai-core hands the runner factories their options; wrapping the three
+// factories lets a test capture exactly which directory/config a run used.
+vi.mock("../../utils/pipeline-factory.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../utils/pipeline-factory.js")>();
+  return {
+    ...actual,
+    createL1Runner: vi.fn(actual.createL1Runner),
+    createL2Runner: vi.fn(actual.createL2Runner),
+    createL3Runner: vi.fn(actual.createL3Runner),
+  };
+});
 
 // ============================
 // Isolated test environment
@@ -560,6 +574,145 @@ describe("per-user store roots (v3 user-scoped instances)", () => {
       expect(await resolve("user:a")).toBe(a); // cached
     } finally {
       await gw.stop();
+    }
+  });
+});
+
+describe("run*WithStore RunScope (per-user store runs)", () => {
+  it("hands the L1/L2/L3 runners scope.dataDir + scope.cfg when given, and the core's own dataDir/cfg otherwise", async () => {
+    const { gw, baseDir } = makeGateway({ enabled: true, ownerUserIds: [] });
+    try {
+      const core = (gw as unknown as { core: TdaiCore }).core;
+      await core.initialize();
+      const coreCfg = (gw as unknown as { config: GatewayConfig }).config.memory;
+
+      type RunnerOpts = { pluginDataDir: string; cfg: MemoryTdaiConfig };
+      const l1: RunnerOpts[] = [];
+      const l2: RunnerOpts[] = [];
+      const l3: RunnerOpts[] = [];
+      const capture = (sink: RunnerOpts[], result: () => unknown) =>
+        ((opts: RunnerOpts) => {
+          sink.push(opts);
+          return async () => result();
+        }) as never;
+      vi.mocked(createL1Runner).mockImplementation(capture(l1, () => ({ storedCount: 0, hasMore: false, hasFullBacklog: false, profileScopes: [] })));
+      vi.mocked(createL2Runner).mockImplementation(capture(l2, () => undefined));
+      vi.mocked(createL3Runner).mockImplementation(capture(l3, () => undefined));
+
+      const store = {} as never;
+      const scopedCfg: MemoryTdaiConfig = {
+        ...coreCfg,
+        extraction: { ...coreCfg.extraction, promptMode: "chat" },
+        persona: { ...coreCfg.persona, promptMode: "chat" },
+      };
+      const scope = { dataDir: path.join(baseDir, "users", "walnut"), cfg: scopedCfg };
+
+      await core.runL1WithStore("s1", store, undefined as never, undefined, undefined, scope);
+      await core.runL2WithStore("s1", store, undefined, undefined, scope);
+      await core.runL3WithStore(store, undefined, scope);
+
+      expect(l1).toHaveLength(1);
+      expect(l2).toHaveLength(1);
+      expect(l3).toHaveLength(1);
+      for (const opts of [l1[0], l2[0], l3[0]]) {
+        expect(opts.pluginDataDir).toBe(scope.dataDir);
+        expect(opts.cfg).toBe(scopedCfg);
+      }
+
+      // Without a scope: the core's own directory and config (unchanged behaviour).
+      await core.runL1WithStore("s1", store, undefined as never);
+      await core.runL2WithStore("s1", store);
+      await core.runL3WithStore(store);
+      expect(l1[1].pluginDataDir).toBe(baseDir);
+      expect(l2[1].pluginDataDir).toBe(baseDir);
+      expect(l3[1].pluginDataDir).toBe(baseDir);
+      expect(l1[1].cfg).toBe(coreCfg);
+    } finally {
+      await gw.stop();
+    }
+  });
+});
+
+describe("buildTaskExecutor RunScope (user-scoped pipeline tasks)", () => {
+  async function makeExecutorHarness(multiUser: GatewayConfig["multiUser"]) {
+    const { gw, baseDir } = makeGateway(multiUser);
+    const inner = gw as unknown as {
+      core: TdaiCore;
+      storePool: unknown;
+      buildTaskExecutor: () => {
+        executeL1: (task: unknown) => Promise<void>;
+        executeL2: (task: unknown) => Promise<void>;
+        executeL3: (task: unknown) => Promise<void>;
+      };
+    };
+    await inner.core.initialize();
+    const calls: Array<{ method: string; args: unknown[] }> = [];
+    const ok = { storedCount: 0, creditUsed: 0, hasMore: false, hasFullBacklog: false, profileScopes: [], skipped: false };
+    for (const method of ["runL1WithStore", "runL2WithStore", "runL3WithStore"] as const) {
+      vi.spyOn(inner.core, method).mockImplementation((...args: unknown[]) => {
+        calls.push({ method, args });
+        return Promise.resolve(ok);
+      });
+    }
+    // buildTaskExecutor captures this.storePool when it is built — install the double first.
+    // The double must satisfy everything TdaiGateway.doStop() calls on the pool
+    // (setGraceCloseDelay + closeAll, server.ts): every test below ends with
+    // `finally { await gw.stop(); }`, and a getStore-only double would throw a
+    // TypeError from the finally block that MASKS the real assertion failure
+    // (review I1 — validated fix, review deviation D2).
+    inner.storePool = {
+      getStore: async () => ({ store: { fake: "store" }, embedding: undefined }),
+      setGraceCloseDelay: () => {},
+      closeAll: async () => {},
+    };
+    const executor = inner.buildTaskExecutor();
+    const task = (type: "L1" | "L2" | "L3", instanceId: string) => ({
+      id: `${type}-${instanceId}`, type, instanceId, sessionId: "s1", teamId: "default", agentId: "default",
+      priority: 0, createdAt: Date.now(), data: { instanceId, teamId: "default", agentId: "default" },
+    });
+    return { gw, baseDir, executor, task, calls };
+  }
+
+  it("passes RunScope { dataDir, cfg } for user-scoped tasks and undefined for main tasks", async () => {
+    const h = await makeExecutorHarness({ enabled: true, ownerUserIds: [], userPromptMode: "chat" });
+    try {
+      await h.executor.executeL1(h.task("L1", "user:walnut"));
+      await h.executor.executeL2(h.task("L2", "user:walnut"));
+      await h.executor.executeL3(h.task("L3", "user:walnut"));
+      await h.executor.executeL1(h.task("L1", "default"));
+      await h.executor.executeL2(h.task("L2", "default"));
+      await h.executor.executeL3(h.task("L3", "default"));
+
+      const userDir = path.join(h.baseDir, "users", "walnut");
+      const expectedScope = {
+        dataDir: userDir,
+        cfg: expect.objectContaining({
+          extraction: expect.objectContaining({ promptMode: "chat" }),
+          persona: expect.objectContaining({ promptMode: "chat" }),
+        }),
+      };
+      const methods = h.calls.map((c) => c.method);
+      expect(methods).toEqual(["runL1WithStore", "runL2WithStore", "runL3WithStore", "runL1WithStore", "runL2WithStore", "runL3WithStore"]);
+      // the scope is always the LAST argument
+      expect(h.calls[0].args.at(-1)).toEqual(expectedScope);
+      expect(h.calls[1].args.at(-1)).toEqual(expectedScope);
+      expect(h.calls[2].args.at(-1)).toEqual(expectedScope);
+      // main tasks: no scope
+      expect(h.calls[3].args.at(-1)).toBeUndefined();
+      expect(h.calls[4].args.at(-1)).toBeUndefined();
+      expect(h.calls[5].args.at(-1)).toBeUndefined();
+    } finally {
+      await h.gw.stop();
+    }
+  });
+
+  it("leaves cfg alone when multiUser.userPromptMode is unset", async () => {
+    const h = await makeExecutorHarness({ enabled: true, ownerUserIds: [] });
+    try {
+      await h.executor.executeL1(h.task("L1", "user:walnut"));
+      expect(h.calls[0].args.at(-1)).toEqual({ dataDir: path.join(h.baseDir, "users", "walnut") });
+    } finally {
+      await h.gw.stop();
     }
   });
 });

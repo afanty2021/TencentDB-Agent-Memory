@@ -150,6 +150,19 @@ export interface TdaiCoreOptions {
   isolation?: { teamId?: string; userId?: string; agentId?: string };
 }
 
+/**
+ * Per-run overrides for the externally-provided-store entry points.
+ *
+ * A user-scoped run (docs/per-user-stores-v3-design.md §6.5, §8) passes the
+ * user's own data directory — checkpoints, `profiles/` discovery and the
+ * JSONL fallbacks hang off it — and the prompt family to run with. Omitted →
+ * the core's own `dataDir` / `cfg` (the main store).
+ */
+export interface RunScope {
+  dataDir?: string;
+  cfg?: MemoryTdaiConfig;
+}
+
 // ============================
 // TdaiCore
 // ============================
@@ -1098,6 +1111,7 @@ export class TdaiCore {
      * standalone 单进程不需要传（进程内 withFileLock 已足够）。
      */
     checkpointLock?: import("../utils/checkpoint.js").CheckpointLockOptions,
+    scope?: RunScope,
   ): Promise<{ storedCount: number; creditUsed: number; hasMore: boolean; hasFullBacklog: boolean; profileScopes: string[] }> {
     const useStandaloneRunner = this.cfg.llm.enabled || this.hostAdapter.hostType !== "openclaw";
     const openclawConfig = (!useStandaloneRunner && this.hostAdapter.hostType === "openclaw")
@@ -1123,8 +1137,8 @@ export class TdaiCore {
       : undefined;
 
     const runner = createL1Runner({
-      pluginDataDir: this.dataDir,
-      cfg: this.cfg,
+      pluginDataDir: scope?.dataDir ?? this.dataDir,
+      cfg: scope?.cfg ?? this.cfg,
       openclawConfig,
       vectorStore: store,
       embeddingService: embedding,
@@ -1148,7 +1162,7 @@ export class TdaiCore {
   /**
    * Run L2 scene extraction using an externally provided Store.
    */
-  async runL2WithStore(sessionKey: string, store: IMemoryStore, storage?: StorageAdapter, cursor?: string): Promise<{ creditUsed: number; skipped: boolean }> {
+  async runL2WithStore(sessionKey: string, store: IMemoryStore, storage?: StorageAdapter, cursor?: string, scope?: RunScope): Promise<{ creditUsed: number; skipped: boolean }> {
     const useStandaloneRunner = this.cfg.llm.enabled || this.hostAdapter.hostType !== "openclaw";
     const openclawConfig = (!useStandaloneRunner && this.hostAdapter.hostType === "openclaw")
       ? (this.hostAdapter as { getOpenClawConfig?(): unknown }).getOpenClawConfig?.()
@@ -1173,8 +1187,8 @@ export class TdaiCore {
       : undefined;
 
     const runner = createL2Runner({
-      pluginDataDir: this.dataDir,
-      cfg: this.cfg,
+      pluginDataDir: scope?.dataDir ?? this.dataDir,
+      cfg: scope?.cfg ?? this.cfg,
       openclawConfig,
       vectorStore: store,
       logger: this.logger,
@@ -1192,7 +1206,7 @@ export class TdaiCore {
   /**
    * Run L3 persona generation using an externally provided Store.
    */
-  async runL3WithStore(store: IMemoryStore, storage?: StorageAdapter): Promise<{ creditUsed: number }> {
+  async runL3WithStore(store: IMemoryStore, storage?: StorageAdapter, scope?: RunScope): Promise<{ creditUsed: number }> {
     const useStandaloneRunner = this.cfg.llm.enabled || this.hostAdapter.hostType !== "openclaw";
     const openclawConfig = (!useStandaloneRunner && this.hostAdapter.hostType === "openclaw")
       ? (this.hostAdapter as { getOpenClawConfig?(): unknown }).getOpenClawConfig?.()
@@ -1217,8 +1231,8 @@ export class TdaiCore {
       : undefined;
 
     const runner = createL3Runner({
-      pluginDataDir: this.dataDir,
-      cfg: this.cfg,
+      pluginDataDir: scope?.dataDir ?? this.dataDir,
+      cfg: scope?.cfg ?? this.cfg,
       openclawConfig,
       vectorStore: store,
       logger: this.logger,
