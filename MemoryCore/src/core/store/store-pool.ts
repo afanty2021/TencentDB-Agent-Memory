@@ -13,6 +13,7 @@
  * standalone 模式下:
  *   - VdbConfig 为空或来自环境变量 → 创建 SQLite Store
  *   - 固定一个 "default" instanceId, 行为与原 createStoreBundle 一致
+ *   - user:<uid> 实例落 users/<uid>/vectors.db（按人分库）
  */
 
 import path from "node:path";
@@ -30,6 +31,7 @@ import { getSharedMongoClientPool } from "./mongodb/client-pool.js";
 import type { MongoClientPool } from "./mongodb/client-pool.js";
 import { createBM25Encoder } from "./bm25-local.js";
 import type { BM25LocalEncoder } from "./bm25-local.js";
+import { parseUserScopeInstanceId } from "./store-scope.js";
 import type { VdbConfig, MongoConfig } from "../instance-config-provider.js";
 import type { ISkillStore } from "../skill/skill-store.interface.js";
 import { metricProducer } from "../report/kafka-metric-producer.js";
@@ -485,10 +487,15 @@ export class StorePool {
 
   /**
    * SQLite 文件路径:
+   *   - "user:<uid>" → dataDir/users/{uid}/vectors.db（按人分库，docs/per-user-stores-v3-design.md §6.3）
    *   - "default" → dataDir/vectors.db (兼容原逻辑)
    *   - 其他 instanceId → dataDir/instances/{instanceId}/vectors.db
    */
   private getSqlitePath(instanceId: string): string {
+    const userScope = parseUserScopeInstanceId(instanceId);
+    if (userScope) {
+      return path.join(this.dataDir, "users", userScope.uid, "vectors.db");
+    }
     if (instanceId === "default") {
       return path.join(this.dataDir, "vectors.db");
     }
