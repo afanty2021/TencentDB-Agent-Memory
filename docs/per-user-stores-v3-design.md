@@ -1,6 +1,6 @@
 # v3 面按人分库（per-user stores）— 设计文档
 
-- 状态：**设计已获用户认可（2026-11-27），待出实施计划**
+- 状态：**已实施（2026-11-27，`port/multi-user-stores`），三席评审通过（2026-11-28，0 Critical / 0 Important），割接前小修批已修。未推送、未上线——§13.1 每一步等口令。**
 - 日期：2026-11-27（调研 11-26）
 - 分支：`port/multi-user-stores`
 - 取代：`docs/v3-user-routing-design.md` 的 Option B′-subsume（共享库 + 列隔离 + team 槽位顶替）。该文档的 §1 隔离模型实测、§2 列错位问题仍然有效，仅路由方案被本文取代。
@@ -196,7 +196,7 @@ multiUser:
 |---|---|---|---|
 | `enabled` | `TDAI_MULTI_USER` | `false` | 不变 |
 | `ownerUserIds` | `TDAI_MULTI_USER_OWNERS` | `[]` | 不变 |
-| `userPromptMode` | `TDAI_MULTI_USER_PROMPT_MODE` | 不设置 | `chat` 或 `code`；非法值在 stderr 告警并按未设置处理 |
+| `userPromptMode` | `TDAI_MULTI_USER_PROMPT_MODE` | 不设置 | `chat` 或 `code`；非法值在 stderr 告警并按未设置处理。env 为空串或全空白（`VAR=` 这类泄漏）视同未设置、回落 yaml；yaml 值不是字符串时同样告警 |
 
 **启动即拒**：`multiUser.enabled=true` 且 `deployMode=service` 时，网关 `start()` 抛错退出（本文只支持 standalone）。
 
@@ -253,20 +253,27 @@ node --import tsx scripts/import-per-user-stores.ts --data-dir <baseDir> [--owne
 
 **用户集合** = 主库 `l0_conversations` 与 `l1_records` 两表里 `user_id ∉ ('', 'default')` 的所有 uid ∪ `users/` 下带 `vectors.db` 的目录名 − `--owners`。
 
+候选按**归一化后的 uid** 判定与分组，与网关路由是同一套规则：
+
+- 归一化后不是合法 uid 的候选跳过并计数（网关路由不到它）。
+- 归一化后等于 `default` 的任何拼法都留在主库：网关永远把 `default` 路由到主库，建出来的 `users/default/` 只会是一份无人读到的影子库。
+- `--owners` 按归一化 uid 比对——库行存的是混大小写原值时同样排除。生效的 owner 列表与被忽略的非法条目在开头打印；`--confirm` 没有有效 `--owners` 时在 stderr 告警（脚本无从得知本部署的属主；有属主而漏带，属主的行会被复制进一份网关永不路由的副本，无害但非本意，清除见 §13.3）。
+- 归一化后相同的多个候选并成**一个库、一行报告**。
+
 对每个 uid：
 
 1. 建 `users/<uid>/` 及子目录。
 2. 用引擎打开 `users/<uid>/vectors.db`：`new VectorStore(path, 0, logger)` → `init()`。库不存在则新建；Gen B 旧库则在线迁移（补列、重建 FTS）。
-3. 用 `node:sqlite` 打开用户库，从只读打开的主库逐行复制该 uid 的 L0、L1（显式列清单，`INSERT OR IGNORE` 以 `record_id` 去重）。
+3. 用 `node:sqlite` 打开用户库，从只读打开的主库逐行复制该 uid 的 L0、L1（显式列清单，`INSERT OR IGNORE` 以 `record_id` 去重；复制谓词绑定的是库里实际存的拼法）。
 4. 改挂：`UPDATE … SET user_id = <uid> WHERE user_id <> <uid>`（L0、L1 各一次）。依据：按人库里所有行都属于这个人；此步把 Gen B 旧行（迁移后默认标成 `default`）挂到本人名下。
 5. 再次用引擎打开，调 `rebuildFtsIndex()`（公开方法，`sqlite/memory-store.ts:3189`，用引擎自己的分词重建）。
-6. 留档：把主库 `conversations/*.jsonl`、`records/*.jsonl` 中 `userId` 等于该 uid 的行，追加到用户库同名文件；按行 `id` 去重。
+6. 留档：把主库 `conversations/*.jsonl`、`records/*.jsonl` 中 `userId` 归一化后等于该 uid 的行，逐字节追加到用户目录的同名文件；按行 `id` 去重。留档行的 `userId` 与库行同源、同拼法（网关写入时两边都是原值），所以谓词两边都要归一化。
 
 **不迁的**：场景块、画像、checkpoint（各人从自己的记忆重新生成）；owner 的行（留在主库）；default 桶。
 
 **dry-run 只读**：不建目录、不以写方式打开任何库；对旧库只读 `pragma table_info` 判断「将被原地升级」并报告。
 
-**确认后的自检**（不通过则非零退出）：每个 uid 的用户库里所有行都归属本人，且 `count(user_id = uid)` 不少于主库该 uid 行数；主库 L0/L1 总行数执行后**不少于**执行前（导入期间网关仍在运行，主库可能新增；脚本从不删主库行，所以减少即异常）。
+**确认后的自检**（不通过则非零退出）：每个 uid 的用户库里所有行都归属本人，且 `count(user_id = uid)` 不少于主库该 uid 行数；全文索引的行数与基表逐表相等——引擎 `rebuildFtsIndex()` 对分词失败的行只打 WARN 跳过，索引短于基表即判不通过，否则关键词召回会静默缺行而脚本仍报成功；主库 L0/L1 总行数执行后**不少于**执行前（导入期间网关仍在运行，主库可能新增；脚本从不删主库行，所以减少即异常）。
 
 **预期结果（2026-11-26 数据）**：
 
@@ -292,7 +299,7 @@ subsume 方案整体让位于本文：
 | `applyMultiUserV3Routing`（`v2-router.ts:244`） | 由 `routeV3ByUser` 取代。保留：uid 归一化 fail-closed、default 写门禁。删除：team 槽位顶替、读路由剥离 team |
 | `V3_USER_SCOPED_SUBPATHS`、`subsumedTeam` 标记及其在 `handleConversationAdd` 里跳过资产登记的分支 | 删除。资产登记恢复 `multiUser` 关闭时的行为 |
 | `scripts/backfill-multiuser-teams.ts` | 删除，由 §9 脚本取代 |
-| `/v3/chat-memory/clear` 的 `user_ids` 寻址模式（`chat-memory-handlers.ts:534-600`） | **下线**：`multiUser` 开启时返回 400，提示按 §13.3 处理。原因：它会清主库里该人的休眠副本并报成功，而本人的真实库未动。`memory_ids` 资产寻址模式不变 |
+| `/v3/chat-memory/clear` 的 `user_ids` 寻址模式（`chat-memory-handlers.ts:534-600`） | **下线**：请求带 `user_ids` 一律 400，与开关状态无关，提示按 §13.3 处理。原因：它会清主库里该人的休眠副本并报成功，而本人的真实库未动。`memory_ids` 资产寻址模式不变（它只作用主库，见 §13.3） |
 | `multi-user.test.ts` 中 `applyMultiUserV3Routing`（9 条）、`v3 dispatch wiring`（6 条）、`chat-memory clear user-scope`（8 条） | 由 §12 的对应测试取代 |
 | `gateway.multi-user.e2e.test.ts` 的 subsume 场景 | 由 §12 的物理分库场景取代 |
 | `docs/v3-user-routing-design.md`、`PORT-NOTES.md` | 实施时加「v3 路由方案已被本文取代」的指引 |
@@ -305,6 +312,7 @@ v1 协议的按人 core 路径及其 11 条单测原样保留。
 - **目录穿越**：uid 必须匹配 `^[a-z0-9_-]{1,64}$` 才会被拼进路径；`buildUserScopeInstanceId` 对非法 uid 抛错；`LocalStorageBackend` 另有根目录逃逸检查。
 - **信任边界同 09-14**：网关绑定 127.0.0.1，本方案防用户之间串库，不防持有网关密钥的本地进程——`user_id` 是调用方自声明字段，持钥者本来就能冒充任意 uid。
 - **日志**：uid 是标识符，可以进日志；记忆内容、查询文本不进日志（现有约定）。
+- **遥测是另一条通道，上述约定不管它**：v3 的 `/conversation/search` 与 `/atomic/search` 会把查询原文与前 5 条命中内容（各截 200 字符）写进当前 span 的属性（`tdai.recall.query` / `tdai.recall.results`，上游为在线评测系统所写，`v2-router.ts:1124-1146`、`:1399-1432`）。没有活跃 span 时什么都不记；一旦启用了会产生并导出 span 的可观测性组件，这些内容会随 span 离开本机。本部署以 observability 全关为前提（§13.1 第 4 步核对）；日后若要开遥测，先给内容采集加开关。
 
 ## 12. 测试计划（TDD，先红后绿）
 
@@ -320,8 +328,16 @@ v1 协议的按人 core 路径及其 11 条单测原样保留。
 | `run*WithStore` | 传 `RunScope` 时用它的目录与配置，不传时行为不变 |
 | executor | 用户域任务构造 `RunScope`（目录 + 两个 promptMode）；主库任务不构造 |
 | 配置 | `userPromptMode` 的 yaml/env 读取、非法值处理；service + enabled 启动即拒 |
-| `chat-memory clear` | `user_ids` 在 `multiUser` 开启时 400 |
+| `chat-memory clear` | `user_ids` 一律 400（与开关无关） |
 | 导入库函数 | 新建库复制数正确；旧 schema 库被升级且旧行改挂；重复执行不翻倍；主库行数不变；全文检索能搜到复制进来的行 |
+
+**评审小修批补充（2026-11-28，均先红后绿）**
+
+| 对象 | 钉住的行为 |
+|---|---|
+| 导入库函数 | owner 与 `default` 桶按归一化 uid 排除（库行存混大小写原值时同样排除，且不建 `users/default/`）；同一 uid 的多种拼法并成一个库、一行报告；留档行按归一化 `userId` 匹配（夹具用库行与留档行**同拼法**的真实组合）；有行未能进全文索引时自检判不通过；开头报告生效的 owner 列表并具名被忽略的非法条目 |
+| 导入 CLI（真脚本子进程） | `--confirm` 无有效 `--owners` 时 stderr 告警；全由非法条目组成的 `--owners` 视同没有；自检不通过时退出码 1 并报出全文索引计数 |
+| executor | 用户域 flush 任务不触达主 core 的 `handleSessionEnd`（warn 后返回）；主库实例的 flush 照常 |
 
 旧 schema 夹具：取 `users/教师 A/vectors.db` 的 `sqlite_master` DDL（仅结构，无数据）作为测试夹具。
 
@@ -342,9 +358,9 @@ v1 协议的按人 core 路径及其 11 条单测原样保留。
 1. 备份：`sqlite3 -readonly <live>/vectors.db ".backup <备份目录>/vectors.db"`；`cp -R users/ <备份目录>/users/`。
 2. 导入 dry-run（`--owners huangzhengbo`），核对 §9 预期表。
 3. 导入 `--confirm`（此时开关未开，新库尚无人读）。
-4. 改仓内 `MemoryCore/tdai-gateway.yaml`：`multiUser.enabled: true`、`ownerUserIds: [huangzhengbo]`、`userPromptMode: chat`；提交。
+4. 改仓内 `MemoryCore/tdai-gateway.yaml`：`multiUser.enabled: true`、`ownerUserIds: [huangzhengbo]`、`userPromptMode: chat`；提交。同时核对 `observability` 块保持全关（§11 遥测面：开启后搜索的查询原文与命中内容会随 span 外发）。
 5. 重启网关：结束 8420 监听进程，由插件监督器重拉（配置是网关侧读的，Hermes 不必重启）。避开周日 19:00–20:00 周报窗与 05:00 / 08:00 的 cron。
-6. 补跑一次导入（幂等），收掉第 3 步到第 5 步之间的增量。
+6. 补跑一次导入（`--owners` 同第 2 步；幂等），收掉第 3 步到第 5 步之间的增量。此时开关已开、网关在写用户库，而每次 confirm 都会对每个用户库重建一次全文索引：自检的索引行数对账若恰好撞上同一用户库的并发写入，可能因多出一条重复索引行而报不通过——重跑一次即重建并通过（此为代码分析所得，未实测）。
 7. 验收：网关日志出现 `Multi-user routing ENABLED … layout=<baseDir>/users/<uid>/`；以 教师 A 身份读能检索到 9 月与 10 月的行、画像为空；以 default 身份写被 400；下一场 cron 的 agent.log 出现 `sync failed: HTTP Error 400` 且任务照常完成。
 
 ### 13.2 回滚
@@ -355,6 +371,9 @@ v1 协议的按人 core 路径及其 11 条单测原样保留。
 
 确认该用户最后一条写入距今超过 10 分钟 → 停网关 → `mv users/<uid>/ users/<uid>.removed-<日期>/` → 起网关。可逆。若该用户此后仍会发消息，下次写入会重建空目录。
 
+- **这一步不是擦除。** 挪走的只是她自己的库；主库里那些割接前的来源行原样还在（导入是复制，主库从未被脚本写过），`multiUser.enabled: false` 回滚后它们会重新可见。要连主库里的旧行一起清，是另一次针对主库的操作。
+- **`/v3/chat-memory/clear` 的 `memory_ids` 清空只作用主库。** 该路由不走按人路由（`getStore()` 取的是主库），按人分库后清不到 `users/<uid>/` 里的内容——它报成功不代表本人的库被清。要清本人的库，走上面的规程。
+
 ## 14. 已核实的依据与风险
 
 **读代码核实（2026-11-27）**
@@ -364,7 +383,7 @@ v1 协议的按人 core 路径及其 11 条单测原样保留。
 - LLM 配置解析只在 `provider=proxy` 时用到实例号（`llm-provider-resolver.ts:33`）；live 不是 proxy。
 - 「预热」不是启动扫描：`enableWarmup` 只影响新会话头几轮的触发门槛（`stateful-pipeline-manager.ts:192`），不会重抽 9 月的对话。
 - 旧个人目录没有 `checkpoint.json`（只有 `recall_checkpoint.json`），新引擎会新建；读取失败时回落默认值（`checkpoint.ts:280-335`）。
-- `discoverProfileScopes` 只列 `profiles/` 下的目录（`pipeline-factory.ts:146`），目录顶层的旧画像、旧场景块不会被当成画像域。
+- `discoverProfileScopes` 只列 `profiles/` 下的目录（`pipeline-factory.ts:146`）。单凭这一点挡不住旧场景块：L3 在一个画像域都没发现时会回落到默认域（`executionScopes = scopes.length > 0 ? scopes : [DEFAULT_PROFILE_SCOPE]`，`pipeline-factory.ts:967`），而默认域读的是目录顶层的场景索引。真正挡住的是两件事叠加——导入不迁场景块，用户目录顶层是空的；场景索引为空时 L3 直接跳过、不调 LLM（`pipeline-factory.ts:1003-1008`）。主库目录顶层的旧画像、旧场景块留在原地，用户域读不到。
 
 **风险**
 
@@ -374,6 +393,8 @@ v1 协议的按人 core 路径及其 11 条单测原样保留。
 | 续聊旧会话时 L1 重抽 | 去重环节合并；与丢失 checkpoint 后的行为一致 |
 | 每人各跑一套管线，LLM 调用次数上升 | 与 9 月 Gen B 相同量级；教师总数十余人 |
 | `/v3/chat-memory/clear` 的 `user_ids` 模式被某处依赖 | 插件不调用（只调 6 个端点）；上线前 grep 两个仓确认 |
+| 搜索端点把查询原文与命中内容写进 span 属性（上游在线评测用，§11） | observability 保持全关；要开遥测，先给内容采集加开关 |
+| 引擎将来给 L0/L1 加列，导入的显式列清单没跟上 | 导入在开头具名告警「root … has column(s) the import does not copy」；看到即先补 `COLUMNS` 再 confirm |
 
 ## 15. 决策记录
 
@@ -385,4 +406,4 @@ v1 协议的按人 core 路径及其 11 条单测原样保留。
 | 2026-11-27 | 9 月 Gen B 遗留原地接管 | 用户 |
 | 2026-11-27 | 设计（方案 A，§1–§13）认可 | 用户 |
 | 2026-11-27 | owner 留在主库 | 沿用 09-14 评审决策 1，本次设计评审未提异议 |
-| 2026-11-27 | `/v3/chat-memory/clear` 的 `user_ids` 模式下线 | 本文档提出，待用户审阅确认 |
+| 2026-11-27 | `/v3/chat-memory/clear` 的 `user_ids` 模式下线 | 本文档提出，属已认可的设计范围；已随实施落地（8c97ac6），三席评审无异议 |

@@ -3376,6 +3376,16 @@ export class TdaiGateway {
         }
       },
       async executeFlush(task: TaskPayload) {
+        // The flush always targets the main core — handleSessionEnd carries no
+        // instance — so a task that belongs to a user-scoped instance must
+        // never get there: it would end the MAIN instance's session under the
+        // user's session key. The reserved prefix is the tell, whatever shape
+        // the rest of the id has.
+        const instanceId = typeof task.data?.instanceId === "string" ? task.data.instanceId : undefined;
+        if (instanceId?.startsWith(USER_SCOPE_PREFIX)) {
+          gateway.logger.warn(`[executor] flush skipped: user-scoped instances never flush through the main core (instance=${instanceId}, session=${task.sessionId})`);
+          return;
+        }
         await core.handleSessionEnd(task.sessionId);
       },
 

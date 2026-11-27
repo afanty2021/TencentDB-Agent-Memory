@@ -8,10 +8,12 @@
  * Fixture rows are synthetic; nothing here reads a real store.
  */
 import fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { VectorStore } from "../../src/core/store/sqlite/memory-store.js";
@@ -225,11 +227,12 @@ function makeFixture(): string {
 /**
  * Root rows whose stored `user_id` skips normalization (`Alice`): the
  * hypothetical the derivation must survive — the gateway routes the
- * normalized `alice`, so every path/key/identifier the import derives must
- * be normalized, while the root copy predicate keeps selecting exactly the
- * rows discovery found (the raw stored value). The JSONL mirror line
- * carries the normalized `userId`, as the gateway has written it since
- * routing normalization landed.
+ * normalized `alice`, so every path/key/identifier the import derives must be
+ * normalized, while the root copy predicate keeps selecting exactly the rows
+ * discovery found (the raw stored value). The JSONL mirror line carries the
+ * SAME raw value (`userId: "Alice"`): handleConversationAdd writes the
+ * record's `userId` to the mirror as given, exactly like the store row, so a
+ * raw-case row and its mirror line always share one spelling.
  */
 function makeRootWithRawStoredUid(baseDir: string): void {
   const dbPath = path.join(baseDir, "vectors.db");
@@ -245,7 +248,7 @@ function makeRootWithRawStoredUid(baseDir: string): void {
 
   fs.mkdirSync(path.join(baseDir, "conversations"));
   fs.writeFileSync(path.join(baseDir, "conversations", "2026-11-04.jsonl"),
-    `${JSON.stringify({ id: "m-x1", sessionKey: "s-x", sessionId: "s-x", teamId: "default", userId: "alice", agentId: "default", role: "user", content: "(synthetic)", recordedAt: "2026-11-04T00:00:00.000Z", timestamp: 0 })}\n`);
+    `${JSON.stringify({ id: "m-x1", sessionKey: "s-x", sessionId: "s-x", teamId: "default", userId: "Alice", agentId: "default", role: "user", content: "(synthetic)", recordedAt: "2026-11-04T00:00:00.000Z", timestamp: 0 })}\n`);
 }
 
 const summarize = (u: ImportReport["users"][number]) => ({
@@ -253,6 +256,24 @@ const summarize = (u: ImportReport["users"][number]) => ({
   copiedL0: u.copiedL0, copiedL1: u.copiedL1, relabelledL0: u.relabelledL0, relabelledL1: u.relabelledL1,
   jsonlLines: u.jsonlLinesCopied,
 });
+
+// ── fixture: a root row the engine cannot full-text-index ──────────────
+
+/**
+ * A row the engine's `rebuildFtsIndex()` skips one row at a time: content
+ * stored as a BLOB is not a string, so jieba's segmentation throws and the
+ * engine drops the row from the index with a WARN only
+ * (memory-store.ts rebuildFtsIndex, per-row try/catch). The store row itself
+ * is a perfectly ordinary row that the import copies like any other.
+ */
+function addUnindexableL1Row(baseDir: string, user: string): void {
+  const db = new DatabaseSync(path.join(baseDir, "vectors.db"));
+  db.prepare(
+    "INSERT INTO l1_records (record_id, content, type, session_key, session_id, created_time, updated_time, team_id, user_id, agent_id, version) " +
+    "VALUES (?, ?, 'episodic', 's-u', 's-u', '2026-11-02T00:00:00.000Z', '2026-11-02T00:00:00.000Z', 'default', ?, 'default', 1)",
+  ).run("mem-unindexable", new Uint8Array([0xff, 0xfe, 0xfd]), user);
+  db.close();
+}
 
 describe("importPerUserStores", () => {
   it("dry-run reports the plan and creates nothing", async () => {
@@ -438,13 +459,188 @@ describe("importPerUserStores", () => {
       store.close();
     }
 
-    // the JSONL mirror follows the normalized directory and carries the normalized userId
+    // the JSONL mirror follows the normalized directory and carries the root
+    // line verbatim — the raw-case userId it was written with
     expect(fs.readdirSync(path.join(baseDir, "users", "alice", "conversations"))).toEqual(["2026-11-04.jsonl"]);
     const mirror = path.join(baseDir, "users", "alice", "conversations", "2026-11-04.jsonl");
     const lines = fs.readFileSync(mirror, "utf-8").split("\n")
       .filter((l) => l.trim().length > 0)
       .map((l) => JSON.parse(l) as { id: string; userId: string })
       .map((l) => ({ id: l.id, userId: l.userId }));
-    expect(lines).toEqual([{ id: "m-x1", userId: "alice" }]);
+    expect(lines).toEqual([{ id: "m-x1", userId: "Alice" }]);
+  });
+
+  it.each([["alice"], ["ALICE"]])(
+    "excludes the owner by NORMALIZED uid (owners: %j): raw-case owner rows stay in the root and no store is created",
+    async (owner) => {
+      const baseDir = tmp();
+      makeRootWithRawStoredUid(baseDir);
+
+      const report = await importPerUserStores({ baseDir, owners: [owner], confirm: true });
+
+      expect(report.ok).toBe(true);
+      expect(report.users).toEqual([]);
+      expect(fs.existsSync(path.join(baseDir, "users"))).toBe(false);
+      expect(count(path.join(baseDir, "vectors.db"), "SELECT COUNT(*) AS n FROM l0_conversations")).toBe(2);
+    },
+  );
+
+  it("never builds a store for the default bucket under any spelling: a raw 'Default' stays in the root", async () => {
+    const baseDir = tmp();
+    makeRoot(baseDir);
+    const db = new DatabaseSync(path.join(baseDir, "vectors.db"));
+    insertL0(db, { id: "m-d2", session: "s-d", user: "Default", text: "cron row stored before normalization", at: "2026-11-03T00:00:00.000Z" });
+    db.close();
+
+    const report = await importPerUserStores({ baseDir, owners: ["huangzhengbo"], confirm: true });
+
+    expect(report.users.map((u) => u.uid)).toEqual(["alice", "bob"]);
+    expect(fs.readdirSync(path.join(baseDir, "users"))).toEqual(["alice", "bob"]);
+  });
+
+  it("one user, one store, one report row: two raw spellings of a uid import together", async () => {
+    const baseDir = tmp();
+    makeRootWithRawStoredUid(baseDir); // rows + mirror line stored as "Alice"
+    const db = new DatabaseSync(path.join(baseDir, "vectors.db"));
+    insertL0(db, { id: "m-x3", session: "s-x", user: "alice", text: "third round in the attic", at: "2026-11-05T00:00:00.000Z" });
+    db.close();
+
+    const report = await importPerUserStores({ baseDir, confirm: true });
+
+    expect(report.ok).toBe(true);
+    // relabel touches only the two rows stored as "Alice"; the third was already hers
+    expect(report.users.map(summarize)).toEqual([
+      { uid: "alice", legacy: false, rootL0: 3, rootL1: 1, copiedL0: 3, copiedL1: 1, relabelledL0: 2, relabelledL1: 1, jsonlLines: 1 },
+    ]);
+    expect(fs.readdirSync(path.join(baseDir, "users"))).toEqual(["alice"]);
+    const store = new DatabaseSync(path.join(baseDir, "users", "alice", "vectors.db"), { readOnly: true });
+    try {
+      expect(store.prepare("SELECT record_id, user_id FROM l0_conversations ORDER BY record_id").all()).toEqual([
+        { record_id: "m-x1", user_id: "alice" },
+        { record_id: "m-x2", user_id: "alice" },
+        { record_id: "m-x3", user_id: "alice" },
+      ]);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("states the owners that take effect before anything else, and names the --owners entries it had to ignore", async () => {
+    const baseDir = makeFixture();
+    const lines: string[] = [];
+
+    await importPerUserStores({
+      baseDir,
+      owners: ["HuangZhengBo", "bad.id", "huangzhengbo"],
+      log: (line) => lines.push(line),
+    });
+
+    // the effective list comes first, normalized and deduplicated; the ignored entry is named
+    expect(lines[0]).toBe("· owners (kept in the root store): huangzhengbo");
+    expect(lines[1]).toBe("· ignored 1 invalid --owners entry (not a valid uid): bad.id");
+    expect(lines).toHaveLength(2);
+  });
+
+  it("a row the engine could not full-text-index fails the self-check instead of passing silently", async () => {
+    const baseDir = tmp();
+    makeRoot(baseDir);
+    addUnindexableL1Row(baseDir, "bob");
+
+    const report = await importPerUserStores({ baseDir, owners: ["huangzhengbo"], confirm: true });
+
+    const bob = report.users.find((u) => u.uid === "bob");
+    if (!bob) throw new Error("fixture: bob must be imported");
+    // the row itself landed and belongs to her — only the index is short
+    expect(bob.copiedL1).toBe(1);
+    expect(bob.verify).toMatchObject({ userL1: 1, userL1Owned: 1, ftsL0: 1, ftsL1: 0, ok: false });
+    // every other user verified clean; the run as a whole must not be reported as a success
+    expect(report.users.filter((u) => !u.verify?.ok).map((u) => u.uid)).toEqual(["bob"]);
+    expect(report.ok).toBe(false);
+  });
+
+  it("names a root column it does not copy, instead of leaving it behind in every user store without a trace", async () => {
+    const baseDir = makeFixture();
+    const db = new DatabaseSync(path.join(baseDir, "vectors.db"));
+    db.exec("ALTER TABLE l0_conversations ADD COLUMN future_column TEXT DEFAULT ''");
+    db.close();
+    const lines: string[] = [];
+
+    const report = await importPerUserStores({
+      baseDir, owners: ["huangzhengbo"], log: (line) => lines.push(line),
+    });
+
+    // announced up front with the rest of the plan; the explicit column list
+    // still governs what is copied, so the plan itself is unchanged
+    expect(lines[0]).toContain("owners (kept in the root store)");
+    expect(lines[1]).toBe("· root l0_conversations has column(s) the import does not copy: future_column");
+    expect(report.ok).toBe(true);
+    expect(report.users.map((u) => [u.uid, u.rootL0, u.rootL1])).toEqual([["alice", 2, 1], ["bob", 1, 0], ["legacyuser", 0, 0]]);
+  });
+});
+
+// ── CLI: the real script as a subprocess ──────────────────────────────
+
+describe("import-per-user-stores CLI", () => {
+  const memoryCoreDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+
+  /** Run the documented command line with a host env that carries no gateway settings. */
+  function runCli(args: string[]): { code: number | null; stdout: string; stderr: string } {
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter(([key]) => !/^(TDAI_|MEMORY_TENCENTDB_|NODE_OPTIONS$|LANGFUSE_|OTEL_)/.test(key)),
+    );
+    const result = spawnSync(process.execPath, ["--import", "tsx", "scripts/import-per-user-stores.ts", ...args], {
+      cwd: memoryCoreDir,
+      env,
+      encoding: "utf-8",
+      timeout: 60_000,
+    });
+    return { code: result.status, stdout: result.stdout, stderr: result.stderr };
+  }
+
+  it("--confirm with no effective --owners warns on stderr while the owner's rows do get copied", () => {
+    const baseDir = makeFixture();
+
+    const r = runCli(["--data-dir", baseDir, "--confirm"]);
+
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain("--confirm");
+    expect(r.stderr).toContain("--owners");
+    // the situation the warning is about: the owner now has a store of her own
+    expect(fs.readdirSync(path.join(baseDir, "users"))).toContain("huangzhengbo");
+  });
+
+  it("an --owners list made only of invalid entries is no owner list at all", () => {
+    const baseDir = makeFixture();
+
+    const r = runCli(["--data-dir", baseDir, "--owners", "bad.id", "--confirm"]);
+
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain("--owners");
+    expect(r.stdout).toContain("owners (kept in the root store): (none)");
+    expect(r.stdout).toContain("bad.id");
+  });
+
+  it("--confirm with a valid --owners list prints it up front and says nothing on stderr", () => {
+    const baseDir = makeFixture();
+
+    const r = runCli(["--data-dir", baseDir, "--owners", "HuangZhengBo", "--confirm"]);
+
+    expect(r.code).toBe(0);
+    expect(r.stderr).toBe("");
+    expect(r.stdout.split("\n")[0]).toBe("· owners (kept in the root store): huangzhengbo");
+    expect(fs.existsSync(path.join(baseDir, "users", "huangzhengbo"))).toBe(false);
+  });
+
+  it("exits 1 when a user's full-text index came up short, naming the user and the counts", () => {
+    const baseDir = tmp();
+    makeRoot(baseDir);
+    addUnindexableL1Row(baseDir, "bob");
+
+    const r = runCli(["--data-dir", baseDir, "--owners", "huangzhengbo", "--confirm"]);
+
+    expect(r.code).toBe(1);
+    expect(r.stdout).toContain("bob");
+    expect(r.stdout).toContain("全文索引 = 1/0");
+    expect(r.stderr).toContain("自检未通过");
   });
 });

@@ -5,10 +5,14 @@
  *   node --import tsx scripts/import-per-user-stores.ts --data-dir <baseDir> [--owners a,b]            # dry-run
  *   node --import tsx scripts/import-per-user-stores.ts --data-dir <baseDir> [--owners a,b] --confirm  # 执行
  *
+ * --owners = multiUser.ownerUserIds（留在主库的属主），按归一化 uid 比对。有属主的部署
+ * --confirm 时必带：漏带不报错——属主的行会被复制进一份网关永不路由的 users/<uid>/ 副本，
+ * 只在 stderr 告警。生效的 owner 列表与被忽略的非法条目在开头打印。
+ *
  * 退出码：0 = 自检通过；1 = 自检未通过（不要开启 multiUser）；2 = 用法错误。
  * 主库始终只读打开，本脚本对主库零写入。
  */
-import { importPerUserStores } from "./lib/per-user-import.js";
+import { importPerUserStores, resolveOwners } from "./lib/per-user-import.js";
 
 const USAGE =
   "用法: node --import tsx scripts/import-per-user-stores.ts --data-dir <baseDir> [--owners a,b] [--confirm]";
@@ -30,9 +34,19 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
+  // The import cannot know the deployment's owners by itself: without them it
+  // happily copies an owner's rows into a store the gateway never routes to.
+  const owners = ownersArg ? ownersArg.split(",").map((s) => s.trim()).filter(Boolean) : [];
+  if (confirm && resolveOwners(owners).owners.length === 0) {
+    console.error(
+      "⚠ --confirm 未带有效 --owners：若本部署有属主（multiUser.ownerUserIds），属主的行也会被复制进 users/<uid>/" +
+        "（网关始终把属主路由到主库，这份副本无人读到）。有属主请中止并带 --owners 重跑；确无属主可忽略。",
+    );
+  }
+
   const report = await importPerUserStores({
     baseDir,
-    owners: ownersArg ? ownersArg.split(",").map((s) => s.trim()).filter(Boolean) : [],
+    owners,
     confirm,
     log: (line) => console.log(line),
     logger: {
@@ -54,7 +68,7 @@ async function main(): Promise<void> {
     cells.push(String(report.confirm ? u.jsonlLinesCopied : u.jsonlLinesToCopy));
     console.log(cells.join(""));
     if (u.verify && !u.verify.ok) {
-      console.log(`  ✗ 自检未通过：user L0/L1 = ${u.verify.userL0}/${u.verify.userL1}，其中归属本人 = ${u.verify.userL0Owned}/${u.verify.userL1Owned}，主库该人 = ${u.rootL0}/${u.rootL1}`);
+      console.log(`  ✗ 自检未通过：user L0/L1 = ${u.verify.userL0}/${u.verify.userL1}，其中归属本人 = ${u.verify.userL0Owned}/${u.verify.userL1Owned}，全文索引 = ${u.verify.ftsL0}/${u.verify.ftsL1}，主库该人 = ${u.rootL0}/${u.rootL1}`);
     }
   }
   console.log(
@@ -63,7 +77,7 @@ async function main(): Promise<void> {
     "（主库只读打开，本脚本不写主库）",
   );
   if (!report.ok) {
-    console.error("\n✗ 自检未通过（见上）。不要开启 multiUser；先核对备份与 --owners。");
+    console.error("\n✗ 自检未通过（见上）。不要开启 multiUser；先核对备份与 --owners。全文索引不足 = 有行引擎未能分词（见上方 [engine] WARN），重跑会重建索引。");
     process.exit(1);
   }
 }

@@ -2377,8 +2377,12 @@ async function handlePipelineStatus(
       layers[t.type].queued++;
       queuedSessionSets[t.type].add(t.sessionId);
     }
-    // "flush" tasks behave like L1 work (see executor.executeFlush fallback);
-    // tally them under L1 so the seed-v2 idle wait doesn't miss them.
+    // A flush is session-end work, not L1 extraction — the worker routes it to
+    // executor.executeFlush (pipeline-worker.ts executeTask; the `?? executeL1`
+    // there serves executors that have none, which the gateway's never lacks).
+    // It is tallied under L1 all the same so `l1.idle` stays false while a
+    // flush is still queued or running: a caller waiting for the pipeline to
+    // drain must not finish early on account of it.
     if (t.type === "flush") {
       layers.L1.queued++;
       queuedSessionSets.L1.add(t.sessionId);
@@ -2465,4 +2469,5 @@ export {
   handleTaskUpdate,
   handleTaskDelete,
   handlePipelineStatus,
+  V3_ALLOWED_SUBPATHS,
 };

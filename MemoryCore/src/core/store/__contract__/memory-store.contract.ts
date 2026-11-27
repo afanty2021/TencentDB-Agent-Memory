@@ -391,8 +391,10 @@ export function runMemoryStoreContract(harness: MemoryStoreContractHarness): voi
       }
     });
 
-    // per-user 清空契约（multiUser subsume 布局，docs/v3-user-routing-design.md
-    // §4.2(c)）。行存后端（isProfileRowStore）必须满足：
+    // per-user 清空契约：行存后端（isProfileRowStore）的 clearMemoryContent 必须
+    // 满足下列约束。契约本身自 docs/v3-user-routing-design.md §4.2(c) 沿用；
+    // 那份文档的 subsume 路由方案已被 docs/per-user-stores-v3-design.md 取代，
+    // 本契约（按 (team, agent[, user]) 收窄内容行）不受影响。
     //   - L0/L1 内容行按 (team, agent[, user]) 收窄；
     //   - profile 行**永远 team+agent 粒度**——per-user persona 是混合列
     //     population（网关直写行带 user_id，管线经 scope 解析生成的行

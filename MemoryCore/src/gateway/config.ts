@@ -1178,9 +1178,16 @@ function resolveMultiUser(src: Record<string, unknown>): GatewayConfig["multiUse
 
   // 4. userPromptMode — env first (scalar precedence, like enabled). An invalid
   //    value is dropped with a stderr WARN (operator typo visibility); the raw
-  //    value is not echoed.
+  //    value is not echoed. `env()` maps an empty value to undefined, so a
+  //    `VAR=` leak from a plist or shell falls through to yaml instead of masking it.
+  const yamlMode = src["userPromptMode"];
+  if (yamlMode !== undefined && yamlMode !== null && typeof yamlMode !== "string") {
+    process.stderr.write(
+      `[tdai-gateway] WARN: ignoring non-string multiUser.userPromptMode (expected "chat" or "code")\n`,
+    );
+  }
   const rawMode = env("TDAI_MULTI_USER_PROMPT_MODE")
-    ?? (typeof src["userPromptMode"] === "string" ? src["userPromptMode"] : undefined);
+    ?? (typeof yamlMode === "string" ? yamlMode : undefined);
   let userPromptMode: MemoryPromptMode | undefined;
   if (rawMode !== undefined) {
     const normalized = rawMode.trim().toLowerCase();

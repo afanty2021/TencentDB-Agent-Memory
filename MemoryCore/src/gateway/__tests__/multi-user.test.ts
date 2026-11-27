@@ -10,7 +10,7 @@ import { TdaiCore } from "../../core/tdai-core.js";
 import { assertMultiUserLayout, loadGatewayConfig } from "../config.js";
 import type { GatewayConfig } from "../config.js";
 import { TdaiGateway } from "../server.js";
-import { handleV2Route, routeV3ByUser } from "../v2-router.js";
+import { V3_ALLOWED_SUBPATHS, handleV2Route, routeV3ByUser } from "../v2-router.js";
 import { makeChatMemoryRouteTable } from "../chat-memory-handlers.js";
 import { StorageAdapter } from "../../core/storage/adapter.js";
 import { createL1Runner, createL2Runner, createL3Runner } from "../../utils/pipeline-factory.js";
@@ -200,6 +200,42 @@ describe("multiUser config loading", () => {
     expect(warn).toBeTruthy();
     expect(String(warn![0])).not.toContain("teamwork");
   });
+
+  it("treats an EMPTY TDAI_MULTI_USER_PROMPT_MODE as not set, so yaml still applies (a `VAR=` leak must not mask it)", () => {
+    fs.writeFileSync(
+      path.join(tmpRoot, "gateway.yaml"),
+      ["multiUser:", "  enabled: true", "  userPromptMode: chat"].join("\n"),
+    );
+    vi.stubEnv("TDAI_GATEWAY_CONFIG", path.join(tmpRoot, "gateway.yaml"));
+
+    vi.stubEnv("TDAI_MULTI_USER_PROMPT_MODE", "");
+    expect(loadGatewayConfig().multiUser.userPromptMode).toBe("chat");
+    vi.stubEnv("TDAI_MULTI_USER_PROMPT_MODE", "   ");
+    expect(loadGatewayConfig().multiUser.userPromptMode).toBe("chat");
+    // and it is not reported as a typo either
+    expect(stderrSpy.mock.calls.some((call: unknown[]) => String(call[0]).includes("userPromptMode"))).toBe(false);
+
+    // a non-empty value still wins over yaml
+    vi.stubEnv("TDAI_MULTI_USER_PROMPT_MODE", "code");
+    expect(loadGatewayConfig().multiUser.userPromptMode).toBe("code");
+  });
+
+  it.each([
+    ["123", true],
+    ["true", true],
+    ["", false], // an empty yaml value means "not configured", nothing to announce
+  ])("announces a non-string yaml userPromptMode (userPromptMode: %j) instead of dropping it silently", (yamlValue, expectWarn) => {
+    fs.writeFileSync(
+      path.join(tmpRoot, "gateway.yaml"),
+      ["multiUser:", "  enabled: true", `  userPromptMode: ${yamlValue}`].join("\n"),
+    );
+    vi.stubEnv("TDAI_GATEWAY_CONFIG", path.join(tmpRoot, "gateway.yaml"));
+
+    const cfg = loadGatewayConfig();
+    expect("userPromptMode" in cfg.multiUser).toBe(false);
+    const warned = stderrSpy.mock.calls.some((call: unknown[]) => String(call[0]).includes("multiUser.userPromptMode"));
+    expect(warned).toBe(expectWarn);
+  });
 });
 
 describe("assertMultiUserLayout", () => {
@@ -210,6 +246,26 @@ describe("assertMultiUserLayout", () => {
 
   it("refuses multiUser.enabled in service mode (per-user stores are standalone-only)", () => {
     expect(() => assertMultiUserLayout("service", { enabled: true, ownerUserIds: [] })).toThrow(/deployMode=standalone/);
+  });
+
+  it("start() refuses at its first statement — before the data directory is touched", async () => {
+    const baseDir = path.join(tmpRoot, "never-starts");
+    const gw = new TdaiGateway({
+      deployMode: "service",
+      // never the production port, should a regression ever let start() get further
+      server: { port: 18499 },
+      data: { baseDir },
+      multiUser: { enabled: true, ownerUserIds: [] },
+      memory: captureOnlyMemoryConfig(),
+    });
+    try {
+      await expect(gw.start()).rejects.toThrow(/deployMode=standalone/);
+      // initDataDirectories() is the statement right after the check: no
+      // directory means the refusal came before anything was opened or bound
+      expect(fs.existsSync(baseDir)).toBe(false);
+    } finally {
+      await gw.stop();
+    }
   });
 });
 
@@ -237,10 +293,11 @@ describe("TdaiGateway per-user core routing", () => {
   });
 
   it("auto-recall reads the user's own team:{uid} scope; main core stays on the default scope", async () => {
-    // §4.2(c) auto-recall 穿线（P1）：per-user core 注入 isolation 后，
-    // capture 落列 team/user、L2 键 team:{uid}|agent:default、recall 的
-    // profileIsolation 同 scope —— 与 v3 subsume 世界同形。主 core 不注入，
-    // 保持 legacy default 桶行为。
+    // v1 按人 core 的 auto-recall 穿线（§4.2(c)，P1）：per-user core 注入
+    // isolation 后，capture 落列 team/user、L2 键 team:{uid}|agent:default、
+    // recall 的 profileIsolation 同 scope。主 core 不注入，保持 legacy default
+    // 桶行为。v3 用户库是另一套形状（team_id="default"、各人目录下的
+    // team:default|agent:default），见下方 buildTaskExecutor RunScope 用例。
     const { gw, resolve, baseDir } = makeGateway({ enabled: true });
     try {
       const main = await resolve(undefined);
@@ -533,6 +590,26 @@ describe("TdaiGateway per-user core routing", () => {
 
 const ROUTING_ON = { multiUserEnabled: true, ownerUserIds: ["huangzhengbo"] };
 
+/**
+ * Every v3 data-plane route, by class (design §4 #3: the default bucket is
+ * read-only). Hand-listed rather than read off the router's own write set —
+ * the routing tests below assert what each class must do — and pinned equal
+ * to the router's allow-list, so a route added there has to be classified here.
+ */
+const V3_WRITE_ROUTES = [
+  "/conversation/add", "/conversation/delete",
+  "/atomic/update", "/atomic/delete",
+  "/scenario/write", "/scenario/rm",
+  "/core/write",
+] as const;
+const V3_READ_ROUTES = [
+  "/conversation/query", "/conversation/search", "/conversation/count",
+  "/atomic/query", "/atomic/search", "/atomic/count",
+  "/scenario/ls", "/scenario/read", "/scenario/count",
+  "/core/read", "/core/count",
+] as const;
+const V3_ALL_ROUTES = [...V3_WRITE_ROUTES, ...V3_READ_ROUTES];
+
 describe("per-user store roots (v3 user-scoped instances)", () => {
   type ResolveStorage = (instanceId: string) => Promise<StorageAdapter>;
   const resolverOf = (gw: TdaiGateway): ResolveStorage =>
@@ -644,6 +721,7 @@ describe("buildTaskExecutor RunScope (user-scoped pipeline tasks)", () => {
         executeL1: (task: unknown) => Promise<void>;
         executeL2: (task: unknown) => Promise<void>;
         executeL3: (task: unknown) => Promise<void>;
+        executeFlush: (task: unknown) => Promise<void>;
       };
     };
     await inner.core.initialize();
@@ -667,11 +745,11 @@ describe("buildTaskExecutor RunScope (user-scoped pipeline tasks)", () => {
       closeAll: async () => {},
     };
     const executor = inner.buildTaskExecutor();
-    const task = (type: "L1" | "L2" | "L3", instanceId: string) => ({
+    const task = (type: "L1" | "L2" | "L3" | "flush", instanceId: string) => ({
       id: `${type}-${instanceId}`, type, instanceId, sessionId: "s1", teamId: "default", agentId: "default",
       priority: 0, createdAt: Date.now(), data: { instanceId, teamId: "default", agentId: "default" },
     });
-    return { gw, baseDir, executor, task, calls };
+    return { gw, baseDir, core: inner.core, executor, task, calls };
   }
 
   it("passes RunScope { dataDir, cfg } for user-scoped tasks and undefined for main tasks", async () => {
@@ -716,18 +794,38 @@ describe("buildTaskExecutor RunScope (user-scoped pipeline tasks)", () => {
       await h.gw.stop();
     }
   });
+
+  it("executeFlush never runs the main core's session-end for a user-scoped task", async () => {
+    const h = await makeExecutorHarness({ enabled: true, ownerUserIds: [] });
+    try {
+      // pass-through spy: the real handleSessionEnd still runs whenever the executor calls it
+      const flush = vi.spyOn(h.core, "handleSessionEnd");
+
+      await h.executor.executeFlush(h.task("flush", "user:walnut"));
+      expect(flush).not.toHaveBeenCalled();
+      const skipped = warnSpy.mock.calls
+        .map((call: unknown[]) => String(call[0]))
+        .find((line: string) => line.includes("flush skipped"));
+      expect(skipped).toContain("user:walnut");
+
+      // control: a main-instance flush still reaches the main core, for its own session
+      await h.executor.executeFlush(h.task("flush", "default"));
+      expect(flush.mock.calls).toEqual([["s1"]]);
+    } finally {
+      await h.gw.stop();
+    }
+  });
 });
 
 describe("routeV3ByUser (v3 data-plane per-user store routing)", () => {
-  it("routes a regular user to the user pool with a user:<uid> scope instance id", () => {
+  it("classifies every v3 data-plane route — the router's allow-list has no unclassified route", () => {
+    expect([...V3_ALLOWED_SUBPATHS].sort()).toEqual([...V3_WRITE_ROUTES, ...V3_READ_ROUTES].sort());
+  });
+
+  it("routes a regular user to the user pool with a user:<uid> scope instance id — on every data-plane route", () => {
     const expected = { ok: true, pool: "user", uid: "alice", scopeInstanceId: "user:alice" };
-    expect(routeV3ByUser(ROUTING_ON, "alice", "/conversation/add")).toEqual(expected);
-    // Reads and profile routes route the same way: isolation is by store,
-    // the isolation ctx is never rewritten.
-    for (const sub of [
-      "/conversation/query", "/conversation/search", "/atomic/search", "/atomic/count",
-      "/core/read", "/core/write", "/scenario/ls", "/scenario/write",
-    ] as const) {
+    // Isolation is by store; the isolation ctx is never rewritten, whatever the route.
+    for (const sub of V3_ALL_ROUTES) {
       expect(routeV3ByUser(ROUTING_ON, "alice", sub), sub).toEqual(expected);
     }
   });
@@ -738,24 +836,17 @@ describe("routeV3ByUser (v3 data-plane per-user store routing)", () => {
     });
   });
 
-  it("routes owners to the main pool (no scope instance id)", () => {
-    for (const sub of ["/conversation/add", "/core/read"] as const) {
-      expect(routeV3ByUser(ROUTING_ON, "HuangZhengBo", sub)).toEqual({ ok: true, pool: "main", uid: "huangzhengbo" });
+  it("routes owners to the main pool on every data-plane route (no scope instance id)", () => {
+    for (const sub of V3_ALL_ROUTES) {
+      expect(routeV3ByUser(ROUTING_ON, "HuangZhengBo", sub), sub).toEqual({ ok: true, pool: "main", uid: "huangzhengbo" });
     }
   });
 
-  it("routes the 'default' identity to main for reads and rejects it on every write route", () => {
-    for (const sub of [
-      "/conversation/query", "/conversation/search", "/atomic/search",
-      "/core/read", "/core/count", "/scenario/ls", "/scenario/read", "/scenario/count",
-    ] as const) {
+  it("routes the 'default' identity to main on every read route and rejects it on every write route", () => {
+    for (const sub of V3_READ_ROUTES) {
       expect(routeV3ByUser(ROUTING_ON, "default", sub), sub).toEqual({ ok: true, pool: "main", uid: "default" });
     }
-    for (const sub of [
-      "/conversation/add", "/conversation/delete",
-      "/atomic/update", "/atomic/delete",
-      "/scenario/write", "/scenario/rm", "/core/write",
-    ] as const) {
+    for (const sub of V3_WRITE_ROUTES) {
       const r = routeV3ByUser(ROUTING_ON, "default", sub);
       expect(r.ok, sub).toBe(false);
       if (!r.ok) {
@@ -794,7 +885,6 @@ interface FakeL0Row {
 function fakeL0Store() {
   const rows: FakeL0Row[] = [];
   const queryFilters: Array<Record<string, unknown>> = [];
-  let idSeq = 0;
   return {
     rows,
     queryFilters,
@@ -817,14 +907,6 @@ function fakeL0Store() {
         && (f.agentId === undefined || r.agent_id === f.agentId));
       const offset = f.offset ?? 0;
       return { rows: hit.slice(offset, offset + (f.limit ?? 20)), total: hit.length };
-    },
-    seedLegacyRow: (row: Partial<FakeL0Row>) => {
-      rows.push({
-        record_id: `legacy-${++idSeq}`, session_id: "s1", session_key: "s1",
-        team_id: "default", user_id: "alice", agent_id: "default", task_id: "",
-        role: "user", message_text: "legacy-era message", recorded_at: new Date().toISOString(),
-        ...row,
-      });
     },
   };
 }
@@ -1056,17 +1138,21 @@ describe("v3 dispatch wiring (multiUser per-user stores at handleV2Route level)"
       expect(r.body.message).not.toContain("user:b");
       expect(h.state.resolvedInstanceIds).toEqual([]);
 
-      // Whitespace-padded variant: this level sees the header through
+      // Whitespace-padded variants: this level sees the header through
       // parseV2Auth, which already trims — so padding cannot slip a forged
       // id past the handleV2Route guard. (The raw-header gap sits one layer
       // up, at handleRequest — pinned by the handleRequest-level test below.)
-      const padded = await h.dispatch("/conversation/search",
-        { team_id: "default", agent_id: "default", user_id: "alice", query: "hello", limit: 5 },
-        { multiUser, serviceId: " user:b" });
-      expect(padded.status, `multiUser=${multiUser}`).toBe(400);
-      expect(padded.body.message).toContain("reserved prefix");
-      expect(padded.body.message).not.toContain("user:b");
-      expect(h.state.resolvedInstanceIds).toEqual([]);
+      // U+00A0 is the padding that matters in production: the HTTP parser
+      // strips spaces and tabs from header values itself, but not this one.
+      for (const paddedId of [" user:b", "\u00a0user:b"]) {
+        const padded = await h.dispatch("/conversation/search",
+          { team_id: "default", agent_id: "default", user_id: "alice", query: "hello", limit: 5 },
+          { multiUser, serviceId: paddedId });
+        expect(padded.status, `multiUser=${multiUser} service-id=${JSON.stringify(paddedId)}`).toBe(400);
+        expect(padded.body.message).toContain("reserved prefix");
+        expect(padded.body.message).not.toContain("user:b");
+        expect(h.state.resolvedInstanceIds).toEqual([]);
+      }
     }
   });
 
@@ -1105,17 +1191,24 @@ describe("v3 dispatch wiring (multiUser per-user stores at handleV2Route level)"
 
   it("handleRequest-level: a whitespace-padded raw service-id header gets the same reserved-prefix 400", async () => {
     const { gw } = makeGateway({ enabled: true, ownerUserIds: [] });
+    try {
+      // control: the unpadded forged id is rejected by this call path
+      const control = await dispatchAtHandleRequest(gw, "user:b");
+      expect(control.status).toBe(400);
+      expect(control.body.message).toContain("reserved prefix");
 
-    // control: the unpadded forged id is rejected by this call path
-    const control = await dispatchAtHandleRequest(gw, "user:b");
-    expect(control.status).toBe(400);
-    expect(control.body.message).toContain("reserved prefix");
-
-    // padded raw header: trim before startsWith, same verdict, no echo
-    const padded = await dispatchAtHandleRequest(gw, " user:b");
-    expect(padded.status).toBe(400);
-    expect(padded.body.message).toContain("reserved prefix");
-    expect(padded.body.message).not.toContain("user:b");
+      // padded raw headers: trim before startsWith, same verdict, no echo. The
+      // HTTP parser would already have stripped the space; U+00A0 it leaves in
+      // place, so that is the padding a real request can carry up to here.
+      for (const paddedId of [" user:b", "\u00a0user:b"]) {
+        const padded = await dispatchAtHandleRequest(gw, paddedId);
+        expect(padded.status, JSON.stringify(paddedId)).toBe(400);
+        expect(padded.body.message, JSON.stringify(paddedId)).toContain("reserved prefix");
+        expect(padded.body.message, JSON.stringify(paddedId)).not.toContain("user:b");
+      }
+    } finally {
+      await gw.stop();
+    }
   });
 
   it("does not route management-plane (extra) routes by user", async () => {

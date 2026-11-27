@@ -25,7 +25,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import type { Logger } from "../../src/core/types.js";
 import { VectorStore } from "../../src/core/store/sqlite/memory-store.js";
-import { normalizeUserId } from "../../src/utils/user-id.js";
+import { DEFAULT_USER_ID, normalizeUserId } from "../../src/utils/user-id.js";
 import { initDataDirectories } from "../../src/utils/pipeline-factory.js";
 
 const SILENT_LOGGER: Logger = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
@@ -68,6 +68,9 @@ export interface UserVerify {
   /** Rows in the user store whose `user_id` is the uid. */
   userL0Owned: number;
   userL1Owned: number;
+  /** Rows of each table that the engine's full-text index holds — one per row once the rebuild is complete. */
+  ftsL0: number;
+  ftsL1: number;
   ok: boolean;
 }
 
@@ -91,7 +94,10 @@ export interface UserImportReport {
 
 export interface ImportReport {
   confirm: boolean;
-  /** Every user verified and the root totals unchanged. Always `true` for a dry-run. */
+  /**
+   * Every user verified (all her root rows present, every row hers, every row
+   * full-text-indexed) and the root totals unchanged. Always `true` for a dry-run.
+   */
   ok: boolean;
   /** Candidate ids that are not valid uids (cannot be routed to) — left untouched. */
   skippedInvalidUids: number;
@@ -160,7 +166,13 @@ interface JsonlCopyPlan {
   lines: string[];
 }
 
-/** Which root JSONL lines belong to `uid` and are not yet in her mirror files. Read-only. */
+/**
+ * Which root JSONL lines belong to `uid` and are not yet in her mirror files. Read-only.
+ *
+ * The mirror line's `userId` is the record's raw value — the same spelling as
+ * the store row it mirrors — so the predicate compares normalized forms, like
+ * the store-row discovery does.
+ */
 function planJsonlCopy(baseDir: string, uid: string): JsonlCopyPlan[] {
   const plan: JsonlCopyPlan[] = [];
   const userDir = path.join(baseDir, "users", uid);
@@ -168,7 +180,7 @@ function planJsonlCopy(baseDir: string, uid: string): JsonlCopyPlan[] {
     const srcDir = path.join(baseDir, sub);
     if (!fs.existsSync(srcDir)) continue;
     for (const name of fs.readdirSync(srcDir).filter((f) => f.endsWith(".jsonl")).sort()) {
-      const mine = readJsonlLines(path.join(srcDir, name)).filter((line) => jsonlField(line, "userId") === uid);
+      const mine = readJsonlLines(path.join(srcDir, name)).filter((line) => normalizeUserId(jsonlField(line, "userId")) === uid);
       if (mine.length === 0) continue;
       const present = new Set(
         readJsonlLines(path.join(userDir, sub, name)).map((line) => jsonlField(line, "id")),
@@ -191,14 +203,37 @@ export function rootIntact(before: { l0: number; l1: number }, after: { l0: numb
 
 // ── the import ────────────────────────────────────────────────────────
 
+/**
+ * The owners that take effect for a run: normalized the way the gateway
+ * normalizes its routing owners (`resolveUserIdRouting`), so an entry matches
+ * exactly the rows the gateway keeps in the main store. An entry that is not
+ * a valid uid can never match anything — it is returned separately so the
+ * caller can name it instead of dropping it silently.
+ */
+export function resolveOwners(raw: string[] | undefined): { owners: string[]; invalid: string[] } {
+  const owners = new Set<string>();
+  const invalid: string[] = [];
+  for (const owner of raw ?? []) {
+    const uid = normalizeUserId(owner);
+    if (uid === null) invalid.push(owner);
+    else owners.add(uid);
+  }
+  return { owners: [...owners].sort(), invalid };
+}
+
 export async function importPerUserStores(opts: ImportOptions): Promise<ImportReport> {
   const baseDir = path.resolve(opts.baseDir);
   const confirm = opts.confirm === true;
   const log = opts.log ?? (() => {});
   const logger = opts.logger ?? SILENT_LOGGER;
-  const owners = new Set(
-    (opts.owners ?? []).map((owner) => normalizeUserId(owner)).filter((v): v is string => v !== null),
-  );
+  const { owners: effectiveOwners, invalid: invalidOwners } = resolveOwners(opts.owners);
+  const owners = new Set(effectiveOwners);
+  // Say who keeps the main store before anything is read or written: an owner
+  // missing from this list gets a store of her own (unreachable, but unintended).
+  log(`· owners (kept in the root store): ${effectiveOwners.length > 0 ? effectiveOwners.join(", ") : "(none)"}`);
+  if (invalidOwners.length > 0) {
+    log(`· ignored ${invalidOwners.length} invalid --owners entry${invalidOwners.length === 1 ? "" : "ies"} (not a valid uid): ${invalidOwners.join(", ")}`);
+  }
 
   const rootDbPath = path.join(baseDir, "vectors.db");
   if (!fs.existsSync(rootDbPath)) throw new Error(`root store not found: ${rootDbPath}`);
@@ -211,6 +246,13 @@ export async function importPerUserStores(opts: ImportOptions): Promise<ImportRe
       const missing = COLUMNS[table].filter((c) => !have.includes(c));
       if (have.length === 0 || missing.length > 0) {
         throw new Error(`root store table ${table} lacks columns [${missing.join(", ")}] — wrong --data-dir?`);
+      }
+      // A column the root has and this list does not would be left behind in
+      // every user store without a trace. Name it, so a schema that moved on
+      // is seen in the dry-run rather than discovered later as missing data.
+      const uncopied = have.filter((c) => !COLUMNS[table].includes(c));
+      if (uncopied.length > 0) {
+        log(`· root ${table} has column(s) the import does not copy: ${uncopied.join(", ")}`);
       }
     }
     const rootTotalsBefore = rootTotals(root);
@@ -232,31 +274,39 @@ export async function importPerUserStores(opts: ImportOptions): Promise<ImportRe
       }
     }
     let skippedInvalidUids = 0;
-    const uids = [...candidates].filter((candidate) => {
-      if (normalizeUserId(candidate) === null) {
+    // One user = one store = one report row. Discovery saw the RAW stored
+    // values while the gateway routes the NORMALIZED uid: group the candidates
+    // by the uid they route to (two spellings of one uid land in one store).
+    // The routing rules decide who gets a store at all — an id that is not a
+    // valid uid cannot be routed to, and owners and the default bucket always
+    // stay in the root, whatever spelling their rows were stored with.
+    const rawCandidatesByUid = new Map<string, string[]>();
+    for (const candidate of candidates) {
+      const uid = normalizeUserId(candidate);
+      if (uid === null) {
         skippedInvalidUids += 1;
-        return false;
+      } else if (uid !== DEFAULT_USER_ID && !owners.has(uid)) {
+        rawCandidatesByUid.set(uid, [...(rawCandidatesByUid.get(uid) ?? []), candidate]);
       }
-      return !owners.has(candidate);
-    }).sort();
+    }
     if (skippedInvalidUids > 0) log(`· skipped ${skippedInvalidUids} candidate id(s) that are not valid uids`);
 
     const users: UserImportReport[] = [];
-    for (const candidate of uids) {
-      // Discovery saw the RAW stored value; the gateway routes the normalized
-      // uid, so every path/key/identifier below derives from the normalized
-      // form — while the root copy predicate keeps binding the raw candidate,
-      // selecting exactly the rows discovery found.
-      const uid = normalizeUserId(candidate);
-      if (uid === null) throw new Error("unreachable: candidate ids were validity-filtered above");
+    const planned = [...rawCandidatesByUid].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    for (const [uid, rawCandidates] of planned) {
+      // Every path/key/identifier below derives from the normalized uid; the
+      // root copy predicate keeps binding the raw candidates, selecting exactly
+      // the rows discovery found.
       const userDir = path.join(usersDir, uid);
       const userDbPath = path.join(userDir, "vectors.db");
       const existed = fs.existsSync(userDbPath);
+      const rootCount = (table: Table): number => rawCandidates.reduce(
+        (n, raw) => n + scalar(root, `SELECT COUNT(*) AS n FROM ${table} WHERE user_id = ?`, raw), 0);
       const report: UserImportReport = {
         uid,
         legacy: existed && isLegacyStore(userDbPath),
-        rootL0: scalar(root, "SELECT COUNT(*) AS n FROM l0_conversations WHERE user_id = ?", candidate),
-        rootL1: scalar(root, "SELECT COUNT(*) AS n FROM l1_records WHERE user_id = ?", candidate),
+        rootL0: rootCount("l0_conversations"),
+        rootL1: rootCount("l1_records"),
         jsonlLinesToCopy: 0,
         copiedL0: 0,
         copiedL1: 0,
@@ -283,8 +333,8 @@ export async function importPerUserStores(opts: ImportOptions): Promise<ImportRe
               `INSERT OR IGNORE INTO ${table} (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`,
             );
             const rows = root.prepare(
-              `SELECT ${columns.join(", ")} FROM ${table} WHERE user_id = ?`,
-            ).all(candidate) as Array<Record<string, unknown>>;
+              `SELECT ${columns.join(", ")} FROM ${table} WHERE user_id IN (${rawCandidates.map(() => "?").join(", ")})`,
+            ).all(...rawCandidates) as Array<Record<string, unknown>>;
             let inserted = 0;
             for (const row of rows) {
               inserted += Number(insert.run(...columns.map((c) => row[c] ?? null)).changes);
@@ -316,7 +366,8 @@ export async function importPerUserStores(opts: ImportOptions): Promise<ImportRe
           report.jsonlLinesCopied += item.lines.length;
         }
 
-        // self-check: everything the root holds for this uid is in her store, and every row is hers
+        // self-check: everything the root holds for this uid is in her store,
+        // every row is hers, and the full-text index holds every row
         const check = new DatabaseSync(userDbPath, { readOnly: true });
         try {
           const verify = {
@@ -324,11 +375,17 @@ export async function importPerUserStores(opts: ImportOptions): Promise<ImportRe
             userL1: scalar(check, "SELECT COUNT(*) AS n FROM l1_records"),
             userL0Owned: scalar(check, "SELECT COUNT(*) AS n FROM l0_conversations WHERE user_id = ?", uid),
             userL1Owned: scalar(check, "SELECT COUNT(*) AS n FROM l1_records WHERE user_id = ?", uid),
+            // rebuildFtsIndex() drops a row it cannot index with a WARN only:
+            // an index shorter than its table means keyword recall silently
+            // misses that row, so the index is counted like the rows are.
+            ftsL0: scalar(check, "SELECT COUNT(*) AS n FROM l0_fts"),
+            ftsL1: scalar(check, "SELECT COUNT(*) AS n FROM l1_fts"),
           };
           report.verify = {
             ...verify,
             ok: verify.userL0Owned === verify.userL0 && verify.userL1Owned === verify.userL1
-              && verify.userL0Owned >= report.rootL0 && verify.userL1Owned >= report.rootL1,
+              && verify.userL0Owned >= report.rootL0 && verify.userL1Owned >= report.rootL1
+              && verify.ftsL0 === verify.userL0 && verify.ftsL1 === verify.userL1,
           };
         } finally {
           check.close();

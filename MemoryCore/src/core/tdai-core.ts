@@ -142,7 +142,9 @@ export interface TdaiCoreOptions {
    * userId: uid}`，见 gateway `getCoreForUser`）。
    *
    * 写侧：capture 的 L0 行带上 team/user 列 → L1 分组 → L2/L3 scope 全链
-   * 落在 `team:{uid}|agent:default`，与 v3 subsume 世界同形。
+   * 落在 `team:{uid}|agent:default`。这是 v1 按人 core 的形状；v3 用户库
+   * （`users/<uid>/`）的行是 `team_id="default"`、画像域是各人目录下的
+   * `team:default|agent:default`，两套语义并存（docs/per-user-stores-v3-design.md §2 的非目标）。
    * 读侧：auto-recall 的 profileIsolation 用它（替代 auto-recall.ts 内
    * 硬编码的 `{teamId:"default"}` 回退）。
    * 不注入（undefined）→ 两侧行为与既有 standalone 完全一致（default 桶）。
@@ -450,7 +452,8 @@ export class TdaiCore {
       sessionKey: turn.sessionKey,
       sessionId: turn.sessionId,
       // multiUser per-user core：L0 行带 team/user 列（L1 分组 → L2/L3 scope
-      // 同 v3 subsume 形状）；undefined → 缺席列落 default 桶（既有行为）。
+      // 落 `team:{uid}|agent:default`，即 v1 按人 core 的形状）；
+      // undefined → 缺席列落 default 桶（既有行为）。
       ...(this.isolation?.teamId ? { teamId: this.isolation.teamId } : {}),
       ...(this.isolation?.userId ? { userId: this.isolation.userId } : {}),
       cfg: this.cfg,
