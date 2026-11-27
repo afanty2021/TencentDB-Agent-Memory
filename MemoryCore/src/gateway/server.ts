@@ -1155,7 +1155,10 @@ export class TdaiGateway {
       if (pathname.startsWith("/v2/") || pathname.startsWith("/v3/")) {
         const rawServiceId = req.headers["x-tdai-service-id"];
         const serviceId = Array.isArray(rawServiceId) ? rawServiceId[0] : rawServiceId;
-        if (typeof serviceId === "string" && serviceId.startsWith(USER_SCOPE_PREFIX)) {
+        // Trim before the prefix test — the downstream routers (offload/meta
+        // included) read the header through parseV2Auth, which trims, so the
+        // guard must judge the same value they will resolve storage with.
+        if (typeof serviceId === "string" && serviceId.trim().startsWith(USER_SCOPE_PREFIX)) {
           const requestId = makeRequestId();
           this.logger.warn(
             `[handleRequest] [${pathname}] rejected reserved service-id prefix (length=${serviceId.length})`,

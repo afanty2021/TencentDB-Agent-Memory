@@ -242,15 +242,21 @@ export async function importPerUserStores(opts: ImportOptions): Promise<ImportRe
     if (skippedInvalidUids > 0) log(`· skipped ${skippedInvalidUids} candidate id(s) that are not valid uids`);
 
     const users: UserImportReport[] = [];
-    for (const uid of uids) {
+    for (const candidate of uids) {
+      // Discovery saw the RAW stored value; the gateway routes the normalized
+      // uid, so every path/key/identifier below derives from the normalized
+      // form — while the root copy predicate keeps binding the raw candidate,
+      // selecting exactly the rows discovery found.
+      const uid = normalizeUserId(candidate);
+      if (uid === null) throw new Error("unreachable: candidate ids were validity-filtered above");
       const userDir = path.join(usersDir, uid);
       const userDbPath = path.join(userDir, "vectors.db");
       const existed = fs.existsSync(userDbPath);
       const report: UserImportReport = {
         uid,
         legacy: existed && isLegacyStore(userDbPath),
-        rootL0: scalar(root, "SELECT COUNT(*) AS n FROM l0_conversations WHERE user_id = ?", uid),
-        rootL1: scalar(root, "SELECT COUNT(*) AS n FROM l1_records WHERE user_id = ?", uid),
+        rootL0: scalar(root, "SELECT COUNT(*) AS n FROM l0_conversations WHERE user_id = ?", candidate),
+        rootL1: scalar(root, "SELECT COUNT(*) AS n FROM l1_records WHERE user_id = ?", candidate),
         jsonlLinesToCopy: 0,
         copiedL0: 0,
         copiedL1: 0,
@@ -278,7 +284,7 @@ export async function importPerUserStores(opts: ImportOptions): Promise<ImportRe
             );
             const rows = root.prepare(
               `SELECT ${columns.join(", ")} FROM ${table} WHERE user_id = ?`,
-            ).all(uid) as Array<Record<string, unknown>>;
+            ).all(candidate) as Array<Record<string, unknown>>;
             let inserted = 0;
             for (const row of rows) {
               inserted += Number(insert.run(...columns.map((c) => row[c] ?? null)).changes);

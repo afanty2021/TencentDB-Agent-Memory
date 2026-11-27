@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import type http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -1051,8 +1052,70 @@ describe("v3 dispatch wiring (multiUser per-user stores at handleV2Route level)"
         { team_id: "default", agent_id: "default", user_id: "alice", query: "hello", limit: 5 },
         { multiUser, serviceId: "user:b" });
       expect(r.status, `multiUser=${multiUser}`).toBe(400);
+      expect(r.body.message).toContain("reserved prefix");
+      expect(r.body.message).not.toContain("user:b");
+      expect(h.state.resolvedInstanceIds).toEqual([]);
+
+      // Whitespace-padded variant: this level sees the header through
+      // parseV2Auth, which already trims — so padding cannot slip a forged
+      // id past the handleV2Route guard. (The raw-header gap sits one layer
+      // up, at handleRequest — pinned by the handleRequest-level test below.)
+      const padded = await h.dispatch("/conversation/search",
+        { team_id: "default", agent_id: "default", user_id: "alice", query: "hello", limit: 5 },
+        { multiUser, serviceId: " user:b" });
+      expect(padded.status, `multiUser=${multiUser}`).toBe(400);
+      expect(padded.body.message).toContain("reserved prefix");
+      expect(padded.body.message).not.toContain("user:b");
       expect(h.state.resolvedInstanceIds).toEqual([]);
     }
+  });
+
+  // ── handleRequest-level guard (raw header) ─────────────────────────
+  // The dispatch tests above reach the handleV2Route guard through
+  // parseV2Auth, which already trims. These call `handleRequest` directly
+  // with a stubbed req/res — the layer where the guard tests the RAW header
+  // bytes, with no HTTP-parser normalization in between. The offload/meta
+  // routers dispatch below this guard through their own parseV2Auth, so a
+  // padded raw header must be tested the way they read it (trimmed) —
+  // otherwise ` user:b` slips past and opens users/b/ on /v2/offload/*.
+
+  function dispatchAtHandleRequest(
+    gw: TdaiGateway,
+    serviceId: string,
+  ): Promise<{ status: number; body: { message?: string } }> {
+    const req = {
+      url: "/v2/offload/query-mmd",
+      method: "POST",
+      headers: { host: "localhost", "x-tdai-service-id": serviceId },
+    } as unknown as http.IncomingMessage;
+    let statusCode = 0;
+    let bodyRaw = "";
+    const res = {
+      setHeader: () => res,
+      writeHead: (status: number) => { statusCode = status; return res; },
+      end: (chunk?: unknown) => { if (typeof chunk === "string") bodyRaw = chunk; return res; },
+    } as unknown as http.ServerResponse;
+    return (gw as unknown as {
+      handleRequest: (req: http.IncomingMessage, res: http.ServerResponse) => Promise<void>;
+    }).handleRequest(req, res).then(() => ({
+      status: statusCode,
+      body: JSON.parse(bodyRaw || "{}") as { message?: string },
+    }));
+  }
+
+  it("handleRequest-level: a whitespace-padded raw service-id header gets the same reserved-prefix 400", async () => {
+    const { gw } = makeGateway({ enabled: true, ownerUserIds: [] });
+
+    // control: the unpadded forged id is rejected by this call path
+    const control = await dispatchAtHandleRequest(gw, "user:b");
+    expect(control.status).toBe(400);
+    expect(control.body.message).toContain("reserved prefix");
+
+    // padded raw header: trim before startsWith, same verdict, no echo
+    const padded = await dispatchAtHandleRequest(gw, " user:b");
+    expect(padded.status).toBe(400);
+    expect(padded.body.message).toContain("reserved prefix");
+    expect(padded.body.message).not.toContain("user:b");
   });
 
   it("does not route management-plane (extra) routes by user", async () => {

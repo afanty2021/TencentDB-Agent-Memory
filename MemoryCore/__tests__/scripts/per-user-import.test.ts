@@ -220,6 +220,34 @@ function makeFixture(): string {
   return baseDir;
 }
 
+// ── fixture: root store holding a uid stored before normalization ─────
+
+/**
+ * Root rows whose stored `user_id` skips normalization (`Alice`): the
+ * hypothetical the derivation must survive — the gateway routes the
+ * normalized `alice`, so every path/key/identifier the import derives must
+ * be normalized, while the root copy predicate keeps selecting exactly the
+ * rows discovery found (the raw stored value). The JSONL mirror line
+ * carries the normalized `userId`, as the gateway has written it since
+ * routing normalization landed.
+ */
+function makeRootWithRawStoredUid(baseDir: string): void {
+  const dbPath = path.join(baseDir, "vectors.db");
+  const store = new VectorStore(dbPath, 0, SILENT);
+  store.init();
+  const db = new DatabaseSync(dbPath);
+  insertL0(db, { id: "m-x1", session: "s-x", user: "Alice", text: "the heron ledger is kept in the attic", at: "2026-11-04T00:00:00.000Z" });
+  insertL0(db, { id: "m-x2", session: "s-x", user: "Alice", text: "second round in the attic", at: "2026-11-04T00:00:01.000Z" });
+  insertL1(db, { id: "mem-x1", session: "s-x", user: "Alice", content: "the heron ledger keeps itself" });
+  db.close();
+  store.rebuildFtsIndex();
+  store.close();
+
+  fs.mkdirSync(path.join(baseDir, "conversations"));
+  fs.writeFileSync(path.join(baseDir, "conversations", "2026-11-04.jsonl"),
+    `${JSON.stringify({ id: "m-x1", sessionKey: "s-x", sessionId: "s-x", teamId: "default", userId: "alice", agentId: "default", role: "user", content: "(synthetic)", recordedAt: "2026-11-04T00:00:00.000Z", timestamp: 0 })}\n`);
+}
+
 const summarize = (u: ImportReport["users"][number]) => ({
   uid: u.uid, legacy: u.legacy, rootL0: u.rootL0, rootL1: u.rootL1,
   copiedL0: u.copiedL0, copiedL1: u.copiedL1, relabelledL0: u.relabelledL0, relabelledL1: u.relabelledL1,
@@ -380,5 +408,43 @@ describe("importPerUserStores", () => {
     const untouched = new DatabaseSync(path.join(baseDir, "users", "bad.id", "vectors.db"), { readOnly: true });
     expect(cols(untouched, "l0_conversations")).not.toContain("user_id");
     untouched.close();
+  });
+
+  it("imports a raw stored uid under its normalized directory: rows copied, JSONL mirror alongside", async () => {
+    const baseDir = tmp();
+    makeRootWithRawStoredUid(baseDir);
+
+    const report = await importPerUserStores({ baseDir, confirm: true });
+
+    // the report identifies the user by the normalized uid, never the raw stored value
+    expect(report.ok).toBe(true);
+    expect(report.users.map((u) => u.uid)).toEqual(["alice"]);
+    // the store directory carries the NORMALIZED name — asserted via the real
+    // directory entries (path lookups are case-insensitive on macOS, so an
+    // existsSync("users/Alice") probe would silently hit "users/alice")
+    expect(fs.readdirSync(path.join(baseDir, "users"))).toEqual(["alice"]);
+    expect(fs.existsSync(path.join(baseDir, "users", "alice", "vectors.db"))).toBe(true);
+
+    // the root copy predicate still binds the RAW stored value — every row lands
+    const row = report.users[0];
+    expect([row.rootL0, row.copiedL0, row.copiedL1, row.relabelledL0, row.relabelledL1, row.jsonlLinesCopied])
+      .toEqual([2, 2, 1, 2, 1, 1]);
+    expect(row.verify?.ok).toBe(true);
+    const store = new DatabaseSync(path.join(baseDir, "users", "alice", "vectors.db"), { readOnly: true });
+    try {
+      expect(store.prepare("SELECT DISTINCT user_id FROM l0_conversations").all()).toEqual([{ user_id: "alice" }]);
+      expect(store.prepare("SELECT DISTINCT user_id FROM l1_records").all()).toEqual([{ user_id: "alice" }]);
+    } finally {
+      store.close();
+    }
+
+    // the JSONL mirror follows the normalized directory and carries the normalized userId
+    expect(fs.readdirSync(path.join(baseDir, "users", "alice", "conversations"))).toEqual(["2026-11-04.jsonl"]);
+    const mirror = path.join(baseDir, "users", "alice", "conversations", "2026-11-04.jsonl");
+    const lines = fs.readFileSync(mirror, "utf-8").split("\n")
+      .filter((l) => l.trim().length > 0)
+      .map((l) => JSON.parse(l) as { id: string; userId: string })
+      .map((l) => ({ id: l.id, userId: l.userId }));
+    expect(lines).toEqual([{ id: "m-x1", userId: "alice" }]);
   });
 });
