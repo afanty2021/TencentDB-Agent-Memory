@@ -9,8 +9,7 @@ import { TdaiCore } from "../../core/tdai-core.js";
 import { assertMultiUserLayout, loadGatewayConfig } from "../config.js";
 import type { GatewayConfig } from "../config.js";
 import { TdaiGateway } from "../server.js";
-import { applyMultiUserV3Routing, type V3IsolationCtx } from "../v2-router.js";
-import { handleV2Route } from "../v2-router.js";
+import { handleV2Route, routeV3ByUser } from "../v2-router.js";
 import { makeChatMemoryRouteTable } from "../chat-memory-handlers.js";
 import { StorageAdapter } from "../../core/storage/adapter.js";
 
@@ -517,117 +516,72 @@ describe("TdaiGateway per-user core routing", () => {
   });
 });
 
-// ============================
-// v3 data-plane per-user routing (design docs/v3-user-routing-design.md §4.2)
-// ============================
-// Two levels of pinning:
-//   1. applyMultiUserV3Routing — the pure ctx rewrite (matrix below).
-//   2. handleV2Route dispatch wiring — L0 rows land team_id=user_id and the
-//      read filter drops the team dim (dispatch-level suite at the bottom).
-// Real-gateway v3 assertions (L2 task key profile:team:{uid}) are a P1 e2e
-// item; gateway.multi-user.e2e.test.ts currently covers the v1 physical-core
-// surface only.
+const ROUTING_ON = { multiUserEnabled: true, ownerUserIds: ["huangzhengbo"] };
 
-function ctx(overrides: Partial<V3IsolationCtx> = {}): V3IsolationCtx {
-  // Shape resolveIsolation produces for a plugin call: team_id="default"
-  // placeholder + real user, session defaulted.
-  return { teamId: "default", userId: "alice", agentId: "default", sessionId: "default", ...overrides };
-}
-
-describe("applyMultiUserV3Routing (v3 data-plane per-user ctx rewrite)", () => {
-  it("subsumes userId into the team slot on write endpoints when team is the placeholder", () => {
-    const r = applyMultiUserV3Routing(ctx(), "/conversation/add");
-    if (!r.ok) throw new Error("expected ok");
-    expect(r.ctx.teamId).toBe("alice");
-    expect(r.ctx.userId).toBe("alice");
-    expect(r.ctx.agentId).toBe("default");
-    expect(r.ctx.subsumedTeam).toBe(true);
-  });
-
-  it("subsumes on absent team_id (plugin omission) and on profile endpoints", () => {
-    const omitted = applyMultiUserV3Routing(ctx({ teamId: undefined }), "/conversation/add");
-    expect(omitted.ok && omitted.ctx.teamId).toBe("alice");
-    expect(omitted.ok && omitted.ctx.subsumedTeam).toBe(true);
-    // profile 面（core/scenario）同 subsume —— persona 读写都落在 team:{uid}
-    for (const sub of ["/core/read", "/core/write", "/scenario/ls", "/scenario/write"] as const) {
-      const r = applyMultiUserV3Routing(ctx(), sub);
-      expect(r.ok && r.ctx.teamId).toBe("alice");
-    }
-  });
-
-  it("keeps a real (non-placeholder) team_id untouched — team semantics win", () => {
-    const r = applyMultiUserV3Routing(ctx({ teamId: "real-team" }), "/conversation/add");
-    expect(r.ok && r.ctx.teamId).toBe("real-team");
-    expect(r.ok && r.ctx.userId).toBe("alice");
-    expect(r.ok && r.ctx.subsumedTeam).toBeUndefined();
-  });
-
-  it("normalizes user_id (ASCII trim + lowercase) before subsume", () => {
-    const r = applyMultiUserV3Routing(ctx({ userId: "  Alice " }), "/conversation/add");
-    expect(r.ok && r.ctx.teamId).toBe("alice");
-    expect(r.ok && r.ctx.userId).toBe("alice");
-  });
-
-  it("rejects invalid user_id fail-closed without echoing the value", () => {
-    for (const bad of ["walnut.li", "a|team:admin", "../etc/passwd", "x".repeat(65), ""]) {
-      const r = applyMultiUserV3Routing(ctx({ userId: bad }), "/conversation/add");
-      expect(r.ok).toBe(false);
-      // 报字段名不报值（非空非法值不得回显；空串本身就是"值缺席"）
-      if (!r.ok && bad !== "") expect(r.error).not.toContain(bad);
-    }
-  });
-
-  it("strips teamId on L0/L1 user-scoped endpoints (reads + id deletes) so pre/post-cutover rows match", () => {
+describe("routeV3ByUser (v3 data-plane per-user store routing)", () => {
+  it("routes a regular user to the user pool with a user:<uid> scope instance id", () => {
+    const expected = { ok: true, pool: "user", uid: "alice", scopeInstanceId: "user:alice" };
+    expect(routeV3ByUser(ROUTING_ON, "alice", "/conversation/add")).toEqual(expected);
+    // Reads and profile routes route the same way: isolation is by store,
+    // the isolation ctx is never rewritten.
     for (const sub of [
-      "/conversation/query", "/conversation/search", "/conversation/count", "/conversation/delete",
-      "/atomic/query", "/atomic/search", "/atomic/count", "/atomic/delete",
+      "/conversation/query", "/conversation/search", "/atomic/search", "/atomic/count",
+      "/core/read", "/core/write", "/scenario/ls", "/scenario/write",
     ] as const) {
-      const r = applyMultiUserV3Routing(ctx(), sub);
-      expect(r.ok && r.ctx.teamId).toBeUndefined();
-      expect(r.ok && r.ctx.subsumedTeam).toBeUndefined();
-      expect(r.ok && r.ctx.userId).toBe("alice");
+      expect(routeV3ByUser(ROUTING_ON, "alice", sub), sub).toEqual(expected);
     }
   });
 
-  it("reads stay fail-open with the placeholder user_id; profile reads are not gated", () => {
-    // 无显式身份的读保持 fail-open（读历史不丢）；P1 起**写**端点拒绝
-    // placeholder 身份（见下一条），读写行为在这里分家。
-    const read = applyMultiUserV3Routing(ctx({ userId: "default" }), "/conversation/query");
-    expect(read.ok && read.ctx.teamId).toBeUndefined();
-    expect(read.ok && read.ctx.userId).toBe("default");
-    for (const sub of ["/core/read", "/core/count", "/scenario/ls", "/scenario/read", "/scenario/count"]) {
-      const r = applyMultiUserV3Routing(ctx({ userId: "default" }), sub);
-      expect(r.ok).toBe(true); // profile 读不门禁（落在共享 scope）
-      if (r.ok) expect(r.ctx.teamId).toBe("default");
+  it("normalizes the uid before routing", () => {
+    expect(routeV3ByUser(ROUTING_ON, "  Alice ", "/conversation/add")).toEqual({
+      ok: true, pool: "user", uid: "alice", scopeInstanceId: "user:alice",
+    });
+  });
+
+  it("routes owners to the main pool (no scope instance id)", () => {
+    for (const sub of ["/conversation/add", "/core/read"] as const) {
+      expect(routeV3ByUser(ROUTING_ON, "HuangZhengBo", sub)).toEqual({ ok: true, pool: "main", uid: "huangzhengbo" });
     }
   });
 
-  it("rejects placeholder-identity writes on every write endpoint (§4.2(b) default-bucket write gate)", () => {
-    for (const sub of ["/conversation/add", "/atomic/update", "/scenario/write", "/scenario/rm", "/core/write"]) {
-      const r = applyMultiUserV3Routing(ctx({ userId: "default" }), sub);
-      expect(r.ok).toBe(false);
+  it("routes the 'default' identity to main for reads and rejects it on every write route", () => {
+    for (const sub of [
+      "/conversation/query", "/conversation/search", "/atomic/search",
+      "/core/read", "/core/count", "/scenario/ls", "/scenario/read", "/scenario/count",
+    ] as const) {
+      expect(routeV3ByUser(ROUTING_ON, "default", sub), sub).toEqual({ ok: true, pool: "main", uid: "default" });
+    }
+    for (const sub of [
+      "/conversation/add", "/conversation/delete",
+      "/atomic/update", "/atomic/delete",
+      "/scenario/write", "/scenario/rm", "/core/write",
+    ] as const) {
+      const r = routeV3ByUser(ROUTING_ON, "default", sub);
+      expect(r.ok, sub).toBe(false);
       if (!r.ok) {
         expect(r.error).toContain("user_id");
         expect(r.error).toContain("multiUser.enabled");
       }
     }
-    // 真实 team_id 不豁免写门禁：L0/L1 行与 L2/L3 scope 仍带 user 维度
-    const realTeam = applyMultiUserV3Routing(ctx({ userId: "default", teamId: "real-team" }), "/conversation/add");
-    expect(realTeam.ok).toBe(false);
-    // 显式身份的写放行（对照）
-    const explicit = applyMultiUserV3Routing(ctx({ userId: "alice" }), "/conversation/add");
-    expect(explicit.ok).toBe(true);
+  });
+
+  it("rejects an invalid user_id fail-closed on every route, without echoing the value", () => {
+    for (const bad of ["walnut.li", "a|team:admin", "../etc/passwd", "x".repeat(65), "", 42, null, undefined]) {
+      for (const sub of ["/conversation/add", "/core/read"] as const) {
+        const r = routeV3ByUser(ROUTING_ON, bad, sub);
+        expect(r.ok).toBe(false);
+        if (!r.ok && typeof bad === "string" && bad !== "") expect(r.error).not.toContain(bad);
+      }
+    }
+  });
+
+  it("routes everything to main when the feature is off — no normalization gate, no write gate", () => {
+    const off = { multiUserEnabled: false, ownerUserIds: [] as string[] };
+    expect(routeV3ByUser(off, "alice", "/conversation/add")).toEqual({ ok: true, pool: "main", uid: "alice" });
+    expect(routeV3ByUser(off, "default", "/conversation/add")).toEqual({ ok: true, pool: "main", uid: "default" });
+    expect(routeV3ByUser(off, "walnut.li", "/conversation/add")).toEqual({ ok: true, pool: "main", uid: "" });
   });
 });
-
-// ============================
-// v3 dispatch wiring — handleV2Route + multiUserEnabled
-// ============================
-// Pins the dispatch-level contract end to end (design §6.1-2): the hook's
-// conditions, ordering and the requestIsolation pipeline, against a fake L0
-// store that persists/reports the same columns the real store does. The e2e
-// file covers the v1 physical-core surface only — these are the only tests
-// standing guard over the /v3 multiUser routing as of P0.
 
 interface FakeL0Row {
   record_id: string; session_id: string; session_key: string;
@@ -675,46 +629,97 @@ function fakeL0Store() {
   };
 }
 
-interface DispatchResult {
+// ============================
+// v3 dispatch wiring — handleV2Route + multiUserEnabled (per-user stores)
+// ============================
+// Pins the dispatch-level contract end to end (design §4, §6.2) against
+// per-instance resource doubles: one fake L0 store per instance id, so a test
+// can tell WHICH store a request was routed to.
+
+type NotifyCall = [instanceId: string, sessionId: string, rounds: number, teamId: string | undefined, agentId: string | undefined];
+
+interface DispatchOutcome {
   status: number;
   body: { code?: number; message?: string; data?: Record<string, unknown> };
-  assetRegistrations: number;
 }
 
-async function dispatchV3(
-  store: ReturnType<typeof fakeL0Store>,
-  subpath: string,
-  body: Record<string, unknown>,
-  opts: { multiUser?: boolean } = {},
-): Promise<DispatchResult> {
-  const sent: Array<{ status: number; body: unknown }> = [];
-  let assetRegistrations = 0;
-  const deps = {
-    getStore: () => store,
-    getEmbedding: () => undefined,
-    getStorage: () => undefined,
-    logger: { info: () => {}, warn: () => {}, debug: () => {}, error: () => {} },
-    // Runtime default is OFF (server.ts injects the env-backed value).
-    v3StrictIsolation: false,
-    ...(opts.multiUser ? { multiUserEnabled: true } : {}),
-    getMetadataService: () => ({
-      ensureChatMemoryAsset: async () => { assetRegistrations++; },
-    }),
-  } as Parameters<typeof handleV2Route>[6];
-  const req = {
-    url: `/v3${subpath}`,
-    headers: { authorization: "Bearer test-key", "x-tdai-service-id": "test-svc" },
-  } as unknown as Parameters<typeof handleV2Route>[0];
-  const res = {} as unknown as Parameters<typeof handleV2Route>[1];
-  const handled = await handleV2Route(
-    req, res, `/v3${subpath}`, "POST",
-    async () => body,
-    (_res, status, payload) => { sent.push({ status, body: payload }); },
-    deps,
-  );
-  expect(handled).toBe(true);
-  const last = sent[sent.length - 1] as { status: number; body: DispatchResult["body"] };
-  return { status: last.status, body: last.body, assetRegistrations };
+/**
+ * A `dispatch` bound to shared doubles.
+ *   - `main`            the fake store behind the request's own service id ("test-svc")
+ *   - `storeFor(id)`    the fake store behind instance id `id` (created on first use)
+ *   - `state`           every store/storage resolution, pipeline notify and metadata lookup
+ * `withResolvers: false` models a wiring without per-instance resolvers.
+ */
+function makeV3Harness(opts: { withResolvers: boolean } = { withResolvers: true }) {
+  const main = fakeL0Store();
+  const userStores = new Map<string, ReturnType<typeof fakeL0Store>>();
+  const storeFor = (instanceId: string): ReturnType<typeof fakeL0Store> => {
+    if (instanceId === "test-svc") return main;
+    let store = userStores.get(instanceId);
+    if (!store) {
+      store = fakeL0Store();
+      userStores.set(instanceId, store);
+    }
+    return store;
+  };
+  const state = {
+    resolvedInstanceIds: [] as string[],
+    notifications: [] as NotifyCall[],
+    assetRegistrations: 0,
+    metadataInstanceIds: [] as string[],
+  };
+  const dispatch = async (
+    subpath: string,
+    body: Record<string, unknown>,
+    o: { multiUser?: boolean; owners?: string[]; serviceId?: string } = {},
+  ): Promise<DispatchOutcome> => {
+    const sent: Array<{ status: number; body: DispatchOutcome["body"] }> = [];
+    const deps = {
+      getStore: () => main,
+      getEmbedding: () => undefined,
+      getStorage: () => undefined,
+      logger: { info: () => {}, warn: () => {}, debug: () => {}, error: () => {} },
+      // Runtime default is OFF (server.ts injects the env-backed value).
+      v3StrictIsolation: false,
+      ...(o.multiUser ? { multiUserEnabled: true, multiUserOwnerUserIds: o.owners ?? [] } : {}),
+      ...(opts.withResolvers
+        ? {
+            resolveStore: async (instanceId: string) => {
+              state.resolvedInstanceIds.push(instanceId);
+              return { store: storeFor(instanceId), embedding: undefined };
+            },
+            resolveStorage: async (instanceId: string) => {
+              state.resolvedInstanceIds.push(instanceId);
+              return { instanceId } as never;
+            },
+          }
+        : {}),
+      notifyPipeline: async (instanceId: string, sessionId: string, rounds: number, teamId?: string, agentId?: string) => {
+        state.notifications.push([instanceId, sessionId, rounds, teamId, agentId]);
+      },
+      getMetadataService: (instanceId: string) => {
+        state.metadataInstanceIds.push(instanceId);
+        return Promise.resolve({
+          ensureChatMemoryAsset: async () => { state.assetRegistrations += 1; },
+        });
+      },
+    } as Parameters<typeof handleV2Route>[6];
+    const req = {
+      url: `/v3${subpath}`,
+      headers: { authorization: "Bearer test-key", "x-tdai-service-id": o.serviceId ?? "test-svc" },
+    } as unknown as Parameters<typeof handleV2Route>[0];
+    const res = {} as unknown as Parameters<typeof handleV2Route>[1];
+    const handled = await handleV2Route(
+      req, res, `/v3${subpath}`, "POST",
+      async () => body,
+      (_res, status, payload) => { sent.push({ status, body: payload as DispatchOutcome["body"] }); },
+      deps,
+    );
+    expect(handled).toBe(true);
+    const last = sent[sent.length - 1];
+    return { status: last.status, body: last.body };
+  };
+  return { main, userStores, storeFor, state, dispatch };
 }
 
 const addBody = (userId = "alice") => ({
@@ -725,80 +730,166 @@ const addBody = (userId = "alice") => ({
   messages: [{ role: "user", content: "hello from dispatch test" }],
 });
 
-describe("v3 dispatch wiring (multiUser subsume at handleV2Route level)", () => {
-  it("lands L0 rows with team_id = user_id and skips chat-memory asset registration (subsume)", async () => {
-    const store = fakeL0Store();
-    const r = await dispatchV3(store, "/conversation/add", addBody(), { multiUser: true });
+describe("v3 dispatch wiring (multiUser per-user stores at handleV2Route level)", () => {
+  it("routes a regular user's write to the user:<uid> store — team_id stays 'default', user_id is normalized", async () => {
+    const h = makeV3Harness();
+    const r = await h.dispatch("/conversation/add", addBody("  Alice "), { multiUser: true });
     expect(r.status).toBe(200);
-    expect(store.rows).toHaveLength(1);
-    // 列级断言：subsume 后写行的 team 列 = user 列（L2 键由此派生 team:{uid}）
-    expect(store.rows[0].team_id).toBe("alice");
-    expect(store.rows[0].user_id).toBe("alice");
-    // 占位 team 的资产登记被跳过（否则每个 user 一次 team_mismatch warn）
-    expect(r.assetRegistrations).toBe(0);
+    // store, then storage — both resolved for the user-scoped instance id
+    expect(h.state.resolvedInstanceIds).toEqual(["user:alice", "user:alice"]);
+    const rows = h.storeFor("user:alice").rows;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].team_id).toBe("default");
+    expect(rows[0].user_id).toBe("alice");
+    expect(h.main.rows).toHaveLength(0); // the main store never saw it
   });
 
-  it("keeps upstream behavior verbatim when multiUser is off", async () => {
-    const store = fakeL0Store();
-    const r = await dispatchV3(store, "/conversation/add", addBody(), { multiUser: false });
-    expect(r.status).toBe(200);
-    expect(store.rows[0].team_id).toBe("default");
-    expect(store.rows[0].user_id).toBe("alice");
-    expect(r.assetRegistrations).toBe(1);
+  it("notifies the pipeline with the user-scoped instance id", async () => {
+    const h = makeV3Harness();
+    await h.dispatch("/conversation/add", addBody("alice"), { multiUser: true });
+    expect(h.state.notifications).toEqual([["user:alice", "s1", 1, "default", "default"]]);
   });
 
-  it("keeps a real team_id and registers its asset normally", async () => {
-    const store = fakeL0Store();
-    const r = await dispatchV3(store, "/conversation/add", { ...addBody(), team_id: "real-team" }, { multiUser: true });
+  it("keeps team semantics for side effects: the chat-memory asset is registered on the real service id", async () => {
+    const h = makeV3Harness();
+    const r = await h.dispatch("/conversation/add", addBody("alice"), { multiUser: true });
     expect(r.status).toBe(200);
-    expect(store.rows[0].team_id).toBe("real-team");
-    expect(r.assetRegistrations).toBe(1);
+    expect(h.state.assetRegistrations).toBe(1);
+    expect(h.state.metadataInstanceIds).toEqual(["test-svc"]);
   });
 
-  it("query drops the team dim so pre- and post-cutover rows are both visible", async () => {
-    const store = fakeL0Store();
-    store.seedLegacyRow(); // 割接前旧行：team_id="default"
-    const r = await dispatchV3(store, "/conversation/add", addBody(), { multiUser: true });
-    expect(r.status).toBe(200);
+  it("routes a regular user's reads to her own store — her pre-cutover rows in the main store do not leak in", async () => {
+    const h = makeV3Harness();
+    // Pre-cutover row: alice's, but in the main store (feature off).
+    await h.dispatch("/conversation/add", addBody("alice"), { multiUser: false });
+    expect(h.main.rows).toHaveLength(1);
+    // Post-cutover row: alice's, in her own store.
+    await h.dispatch("/conversation/add", addBody("alice"), { multiUser: true });
+    expect(h.storeFor("user:alice").rows).toHaveLength(1);
 
-    // 插件仍发 team_id="default" —— 剥离后两代行同可见
-    const q = await dispatchV3(store, "/conversation/query", {
-      team_id: "default", user_id: "alice", agent_id: "default", session_id: "s1",
-    }, { multiUser: true });
+    const q = await h.dispatch("/conversation/query",
+      { team_id: "default", user_id: "alice", agent_id: "default", session_id: "s1" }, { multiUser: true });
     expect(q.status).toBe(200);
-    expect(q.body.data?.total).toBe(2);
-    // 滤镜级断言：team 维度不在查询条件里
-    expect(store.queryFilters[store.queryFilters.length - 1].teamId).toBeUndefined();
-    expect(store.queryFilters[store.queryFilters.length - 1].userId).toBe("alice");
+    expect(h.state.resolvedInstanceIds.slice(-2)).toEqual(["user:alice", "user:alice"]);
+    expect(q.body.data?.total).toBe(1); // only her own store's row
+    // The isolation ctx is passed through untouched (no team stripping).
+    expect(h.storeFor("user:alice").queryFilters.at(-1)).toMatchObject({ teamId: "default", userId: "alice", agentId: "default" });
   });
 
-  it("rejects an invalid user_id with 400 before any write happens", async () => {
-    const store = fakeL0Store();
-    const r = await dispatchV3(store, "/conversation/add", addBody("walnut.li"), { multiUser: true });
-    expect(r.status).toBe(400);
-    expect(r.body.message).toContain("user_id");
-    expect(r.body.message).not.toContain("walnut.li");
-    expect(store.rows).toHaveLength(0);
-    expect(r.assetRegistrations).toBe(0);
+  it("keeps owners on the main store (identity not rewritten)", async () => {
+    const h = makeV3Harness();
+    const r = await h.dispatch("/conversation/add", addBody("HuangZhengBo"), { multiUser: true, owners: ["huangzhengbo"] });
+    expect(r.status).toBe(200);
+    expect(h.state.resolvedInstanceIds).toEqual(["test-svc", "test-svc"]);
+    expect(h.main.rows).toHaveLength(1);
+    expect(h.main.rows[0].user_id).toBe("HuangZhengBo");
+    expect(h.state.notifications).toEqual([["test-svc", "s1", 1, "default", "default"]]);
+    expect(h.userStores.size).toBe(0);
   });
 
-  it("§4.2(b): rejects identity-less writes (400, zero rows), reads stay fail-open", async () => {
-    const store = fakeL0Store();
-    // 缺席 user_id → resolveIsolation 补 "default" → 写门禁 400
-    const absent = await dispatchV3(store, "/conversation/add", {
+  it("default identity: reads stay on the main store, writes are rejected before any store is touched", async () => {
+    const h = makeV3Harness();
+    const absent = await h.dispatch("/conversation/add", {
       team_id: "default", agent_id: "default", session_id: "s1",
       messages: [{ role: "user", content: "identity-less write" }],
     }, { multiUser: true });
     expect(absent.status).toBe(400);
     expect(absent.body.message).toContain("user_id");
     expect(absent.body.message).toContain("multiUser.enabled");
-    expect(store.rows).toHaveLength(0);
+    expect(h.state.resolvedInstanceIds).toEqual([]);
+    expect(h.main.rows).toHaveLength(0);
 
-    // 对照：读端点同身份缺席仍 fail-open 200
-    const read = await dispatchV3(store, "/conversation/query", {
-      team_id: "default", agent_id: "default", session_id: "s1",
-    }, { multiUser: true });
+    // A1 (2026-11-27): delete 路由同属写门禁——default 身份也不能删共享桶的行。
+    // 闸在选库之前生效，所以断言「没有解析任何 store」即可证明主库未被触碰。
+    const del = await h.dispatch("/conversation/delete",
+      { team_id: "default", agent_id: "default", session_id: "s1", record_id: "m-x" }, { multiUser: true });
+    expect(del.status).toBe(400);
+    expect(h.state.resolvedInstanceIds).toEqual([]);
+    expect(h.main.rows).toHaveLength(0);
+
+    const read = await h.dispatch("/conversation/query",
+      { team_id: "default", agent_id: "default", session_id: "s1" }, { multiUser: true });
     expect(read.status).toBe(200);
+    expect(h.state.resolvedInstanceIds).toEqual(["test-svc", "test-svc"]);
+  });
+
+  it("rejects an invalid user_id with 400 before any store is resolved, without echoing the value", async () => {
+    const h = makeV3Harness();
+    const r = await h.dispatch("/conversation/add", addBody("walnut.li"), { multiUser: true });
+    expect(r.status).toBe(400);
+    expect(r.body.message).toContain("user_id");
+    expect(r.body.message).not.toContain("walnut.li");
+    expect(h.state.resolvedInstanceIds).toEqual([]);
+  });
+
+  it("fails closed with 503 when a user-pool request has no per-instance resolvers", async () => {
+    const h = makeV3Harness({ withResolvers: false });
+    const r = await h.dispatch("/conversation/add", addBody("alice"), { multiUser: true });
+    expect(r.status).toBe(503);
+    expect(h.main.rows).toHaveLength(0); // never silently falls back to the main store
+  });
+
+  it("keeps upstream behavior verbatim when multiUser is off", async () => {
+    const h = makeV3Harness();
+    const r = await h.dispatch("/conversation/add", addBody("alice"), { multiUser: false });
+    expect(r.status).toBe(200);
+    expect(h.state.resolvedInstanceIds).toEqual(["test-svc", "test-svc"]);
+    expect(h.main.rows[0].team_id).toBe("default");
+    expect(h.main.rows[0].user_id).toBe("alice");
+    expect(h.state.assetRegistrations).toBe(1);
+    // default-identity writes are NOT gated when the feature is off
+    const anon = await h.dispatch("/conversation/add", {
+      team_id: "default", agent_id: "default", session_id: "s2",
+      messages: [{ role: "user", content: "anonymous write" }],
+    }, { multiUser: false });
+    expect(anon.status).toBe(200);
+  });
+
+  it("rejects a client-supplied reserved-prefix service id before touching any store — with the feature on or off", async () => {
+    for (const multiUser of [true, false]) {
+      const h = makeV3Harness();
+      const r = await h.dispatch("/conversation/search",
+        { team_id: "default", agent_id: "default", user_id: "alice", query: "hello", limit: 5 },
+        { multiUser, serviceId: "user:b" });
+      expect(r.status, `multiUser=${multiUser}`).toBe(400);
+      expect(h.state.resolvedInstanceIds).toEqual([]);
+    }
+  });
+
+  it("does not route management-plane (extra) routes by user", async () => {
+    const h = makeV3Harness();
+    const deps = {
+      getStore: () => h.main,
+      getEmbedding: () => undefined,
+      getStorage: () => undefined,
+      logger: { info: () => {}, warn: () => {}, debug: () => {}, error: () => {} },
+      multiUserEnabled: true,
+      multiUserOwnerUserIds: [],
+      resolveStore: async (instanceId: string) => {
+        h.state.resolvedInstanceIds.push(instanceId);
+        return { store: h.storeFor(instanceId), embedding: undefined };
+      },
+      resolveStorage: async (instanceId: string) => {
+        h.state.resolvedInstanceIds.push(instanceId);
+        return { instanceId } as never;
+      },
+    } as Parameters<typeof handleV2Route>[6];
+    const req = {
+      url: "/v3/skill/ping",
+      headers: { authorization: "Bearer test-key", "x-tdai-service-id": "test-svc" },
+    } as unknown as Parameters<typeof handleV2Route>[0];
+    const handled = await handleV2Route(
+      req, {} as never, "/v3/skill/ping", "POST",
+      async () => ({ user_id: "alice", team_id: "default", agent_id: "default", session_id: "s1" }),
+      () => {},
+      deps,
+      {
+        "/v3/skill/ping": async (_body, _auth, requestId) => ({ code: 0, message: "ok", request_id: requestId }),
+      },
+    );
+    expect(handled).toBe(true);
+    // Resolved for the request's own service id — "alice" in the body changes nothing here.
+    expect(h.state.resolvedInstanceIds).toEqual(["test-svc", "test-svc"]);
   });
 });
 

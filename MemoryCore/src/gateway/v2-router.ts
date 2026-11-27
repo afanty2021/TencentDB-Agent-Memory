@@ -28,7 +28,13 @@ import { executeMemorySearch } from "../core/tools/memory-search.js";
 import { executeConversationSearch } from "../core/tools/conversation-search.js";
 import type { MemoryRecord } from "../core/record/l1-writer.js";
 import { reportRecallMetrics } from "../core/report/metric-tracking-recall.js";
-import { INVALID_USER_ID_MESSAGE, normalizeUserId } from "../utils/user-id.js";
+import {
+  INVALID_USER_ID_MESSAGE,
+  normalizeUserId,
+  resolveUserIdRouting,
+  type UserIdRoutingOptions,
+} from "../utils/user-id.js";
+import { USER_SCOPE_PREFIX, buildUserScopeInstanceId } from "../core/store/store-scope.js";
 
 // ── Zod schemas (validated types + defaults) ──
 import {
@@ -172,44 +178,22 @@ const V3_ALLOWED_SUBPATHS = new Set<string>([
   "/core/count",
 ]);
 
-/**
- * multiUser v3 数据面 per-user 路由（docs/v3-user-routing-design.md §4.2）。
- *
- * L0/L1 user 维度端点（读 + 按 id 删）：user_id 本身就是 per-user 隔离
- * 维度，剥离 team 维度后割接前（team_id="default"）与割接后
- * （team_id={uid}）两代的行对同一用户都可见/可删——读历史不丢、删语义
- * 与读对称（否则旧行"读得到删不掉"，delete 返回成功却 deleted_count: 0）。
- * 删除走 store 的按 id / 按 session 路径，filter 非空性不受影响。
- * 其余（写 + profile 面）走 subsume。
- */
-const V3_USER_SCOPED_SUBPATHS = new Set<string>([
-  "/conversation/query",
-  "/conversation/search",
-  "/conversation/count",
-  "/conversation/delete",
-  "/atomic/query",
-  "/atomic/search",
-  "/atomic/count",
-  "/atomic/delete",
-]);
-
-/** The plugin client's placeholder team ("default") — treated as absent under multiUser routing. */
-const TEAM_ID_PLACEHOLDER = "default";
-
 /** The isolation placeholder user ("default", filled by resolveIsolation for absent identity). */
 const USER_ID_PLACEHOLDER = "default";
 
 /**
- * v3 数据面**写**端点（§4.2(b) default 桶写拒绝）：这些端点在身份缺席
- * （归一化后为 `"default"` 占位）时会把数据写进共享桶 / 覆盖共享 persona
+ * v3 数据面**写**端点（§4 #3，default 桶只读——含按 id 删，2026-11-27 A1 裁定）：
+ * 这些端点在身份缺席（归一化后为 `"default"` 占位）时会写/删共享桶的行
  * —— multiUser 下 fail-closed 拒绝，要求显式 user_id（真实 team_id 在场
  * 也不豁免：L0/L1 行与 L2/L3 scope 仍带 user 维度）。profile 读
- * （scenario/ls|read|count、core/read|count）与 L0/L1 user 维度端点
- * （读 + 按 id 删）不门禁（fail-open 保持，读历史不丢）。
+ * （scenario/ls|read|count、core/read|count）与 L0/L1 读端点不门禁
+ * （fail-open 保持，读历史不丢）。
  */
 const V3_WRITE_SUBPATHS = new Set<string>([
   "/conversation/add",
+  "/conversation/delete",
   "/atomic/update",
+  "/atomic/delete",
   "/scenario/write",
   "/scenario/rm",
   "/core/write",
@@ -217,32 +201,43 @@ const V3_WRITE_SUBPATHS = new Set<string>([
 
 /**
  * Isolation ctx shape as attached to {@link V2RouterDeps.requestIsolation}.
- * `subsumedTeam` is set by multiUser routing when it rewrote teamId := userId
- * (consumers use it to skip team-semantics side effects, e.g. chat-memory
- * asset registration — see handleConversationAdd).
  */
-export type V3IsolationCtx = { teamId?: string; userId: string; agentId: string; sessionId: string; taskId?: string; subsumedTeam?: boolean };
+export type V3IsolationCtx = { teamId?: string; userId: string; agentId: string; sessionId: string; taskId?: string };
+
+/** Outcome of {@link routeV3ByUser}. */
+export type V3StoreRouting =
+  | { ok: true; pool: "main" | "user"; uid: string; scopeInstanceId?: string }
+  | { ok: false; error: string };
 
 /**
- * multiUser.enabled 时的 v3 数据面 ctx 归一（纯函数，dispatch 处调用）。
+ * multiUser.enabled 时的 v3 数据面选库（纯函数，dispatch 处调用）。
+ * docs/per-user-stores-v3-design.md §4。
  *
- * 上游 userId 顶替语义（`ctx.teamId || ctx.userId`）在写入/读取两侧的列
- * 不一致（设计文档 §2.1 四接缝），不能靠省略 team_id 激活；这里把 userId
- * **并入** teamId（subsume），让下游全程只见 team——解析器/正则/行存/
- * 同步全部零改动，L2 任务键与 profile 行列天然按人。
+ * 隔离靠「每个人的请求落各自的库」，不靠改写隔离上下文：用户域请求的
+ * team_id / agent_id 原样落列，由 dispatch 把选库用的实例号换成
+ * `user:<uid>`（core/store/store-scope.ts）。
  *
- * 规则（v3Subpath ∈ V3_ALLOWED_SUBPATHS 时才被调用）：
- *   1. user_id 归一化（normalizeUserId，与插件侧逐字对齐），非法 → fail-closed
- *      400（报字段不报值——userId 即将进 team 槽，这里封死 scope/filter 注入）。
- *   2. 写端点身份缺席拒绝（§4.2(b)）：写端点 + 归一后 user_id 为 "default"
- *      占位 → 400（共享桶从此只读；读端点不门禁）。
- *   3. L0/L1 user 维度端点（读 + 按 id 删）：剥离 teamId（undefined = 不限 team）。
- *   4. 写/profile 端点：teamId 缺省或为 placeholder "default" 时 := userId
- *      并标记 subsumedTeam；真实 team_id 在场则不动（team 语义优先，
- *      multiUser 模式假设无真实 team）。
+ * 规则（按序，命中即止）：
+ *   0. multiUser 关闭 → 一律主库，不做任何校验（与上游行为逐项一致）。
+ *   1. user_id 归一化（normalizeUserId，与插件侧逐字对齐），非法 → 400。
+ *      报字段不报值——userId 即将拼进目录名，这里封死路径注入。
+ *   2. 写端点 + 归一后 user_id 为 "default" 占位 → 400：缺席身份落的是
+ *      共享 default 桶，multiUser 下该桶只读。
+ *   3. uid ∈ ownerUserIds 或 uid === "default" → 主库。
+ *   4. 其余 → 用户库，实例号 `user:<uid>`。
+ *
+ * 第 2 条不看 owner 名单：把 "default" 列为 owner 也不能让 default 桶重新可写。
  */
-export function applyMultiUserV3Routing(ctx: V3IsolationCtx, v3Subpath: string): { ok: true; ctx: V3IsolationCtx } | { ok: false; error: string } {
-  const uid = normalizeUserId(ctx.userId);
+export function routeV3ByUser(
+  opts: UserIdRoutingOptions,
+  rawUserId: unknown,
+  v3Subpath: string,
+): V3StoreRouting {
+  const uid = normalizeUserId(rawUserId);
+  if (!opts.multiUserEnabled) {
+    // Feature off: verbatim upstream behaviour. `uid` is informational only.
+    return { ok: true, pool: "main", uid: uid ?? "" };
+  }
   if (uid === null) {
     return { ok: false, error: INVALID_USER_ID_MESSAGE };
   }
@@ -252,13 +247,11 @@ export function applyMultiUserV3Routing(ctx: V3IsolationCtx, v3Subpath: string):
       error: "user_id is required on v3 write endpoints under multiUser.enabled: absent identity resolves to the shared \"default\" bucket which is read-only; send an explicit user_id",
     };
   }
-  if (V3_USER_SCOPED_SUBPATHS.has(v3Subpath)) {
-    const { teamId: _dropped, subsumedTeam: _marker, ...rest } = ctx;
-    return { ok: true, ctx: { ...rest, userId: uid } };
+  const routing = resolveUserIdRouting(opts, uid);
+  if (routing.pool === "user") {
+    return { ok: true, pool: "user", uid, scopeInstanceId: buildUserScopeInstanceId(uid) };
   }
-  const subsumed = !ctx.teamId || ctx.teamId === TEAM_ID_PLACEHOLDER;
-  const teamId = subsumed ? uid : ctx.teamId;
-  return { ok: true, ctx: { ...ctx, teamId, userId: uid, ...(subsumed ? { subsumedTeam: true } : {}) } };
+  return { ok: true, pool: "main", uid };
 }
 
 /**
@@ -329,9 +322,11 @@ export interface V2RouterDeps {
    */
   deployMode: "standalone" | "service";
 
-  // ── Service-mode per-instance resolvers (optional) ──
+  // ── Per-instance resolvers ──
   // When provided, v2 handlers resolve store/storage per-request using
   // auth.serviceId as the instanceId key, falling back to the static getters above.
+  // Under multiUser a user-pool request REQUIRES both: the dispatch answers 503
+  // rather than fall back to the main store (docs/per-user-stores-v3-design.md §4).
 
   /** Resolve IMemoryStore + EmbeddingService for a given instanceId (service mode). */
   resolveStore?: (instanceId: string) => Promise<{ store: IMemoryStore; embedding: EmbeddingService | undefined }>;
@@ -401,6 +396,11 @@ export interface V2RouterDeps {
    * docs/v3-user-routing-design.md §4.2). Undefined = off.
    */
   multiUserEnabled?: boolean;
+  /**
+   * `multiUser.ownerUserIds` — owners keep the main store under multiUser
+   * routing. Read by routeV3ByUser at dispatch; irrelevant when the feature is off.
+   */
+  multiUserOwnerUserIds?: string[];
   /** Resolved isolation context for the current request (set by dispatch). */
   requestIsolation?: V3IsolationCtx;
   /** When isolation could not be resolved AND legacy_compat_mode is off, the missing fields. */
@@ -654,25 +654,23 @@ export async function handleV2Route(
   if (!auth) return true;
 
   try {
-    // Pre-resolve per-request store/storage (service mode → per-instance, standalone → core singleton)
-    const resolveStart = Date.now();
-    const resolved = await resolveStoreForRequest(auth, deps);
-    const resolvedStorage = await resolveStorageForRequest(auth, deps);
-    perfMark("resolveStoreAndStorage", `dur=${Date.now() - resolveStart}ms serviceId=${auth.serviceId}`);
-
-    // Wrap deps so handlers use the resolved per-instance resources
-    const resolvedDeps: V2RouterDeps = {
-      ...deps,
-      getStore: () => resolved.store,
-      getEmbedding: () => resolved.embedding,
-      getStorage: () => resolvedStorage,
-    };
-
+    // Body first: under multiUser the store is chosen from the request's
+    // user_id (body or x-tdai-user-id header), so the body must be parsed
+    // before store/storage resolution (docs/per-user-stores-v3-design.md §6.2).
     const bodyStart = Date.now();
     const body = method === "GET"
       ? Object.fromEntries(new URL(req.url ?? pathname, "http://localhost").searchParams.entries())
       : await parseJsonBody(req);
     perfMark("parseJsonBody", `dur=${Date.now() - bodyStart}ms len=${req.headers["content-length"] ?? "?"}`);
+
+    // Reserved namespace: user-scoped instance ids are minted by the gateway
+    // from a validated user_id (routeV3ByUser). A client that sends the prefix
+    // itself must never be able to address another user's store.
+    if (auth.serviceId.startsWith(USER_SCOPE_PREFIX)) {
+      deps.logger.warn(`${TAG} [${pathname}] rejected reserved service-id prefix (length=${auth.serviceId.length})`);
+      sendJson(res, 400, errorEnvelope(400, "x-tdai-service-id uses a reserved prefix", requestId));
+      return true;
+    }
 
     // Tenancy isolation — pulled from body (preferred) or x-tdai-* headers
     // and attached to the per-request deps so handlers can persist
@@ -712,20 +710,62 @@ export async function handleV2Route(
       }
     }
 
-    // multiUser v3 数据面 per-user 路由（docs/v3-user-routing-design.md §4.2）：
-    // user_id 归一化（fail-closed 400）+ 写/profile 端点 subsume（teamId := userId）
-    // + L0/L1 读端点剥离 team。引擎 dispatch 以下零改动。
-    let isoCtx = isoResolved.ctx;
+    // multiUser v3 数据面按人选库（docs/per-user-stores-v3-design.md §4）：
+    // user_id 归一化（fail-closed 400）+ default 桶写门禁 + 选主库还是用户库。
+    // 用户库请求不改写隔离上下文，只把选库/选目录/管线通知用的实例号换成
+    // `user:<uid>`。
+    let scopeInstanceId: string | undefined;
+    let routedUid: string | undefined;
     if (deps.multiUserEnabled && isV3 && !isV3Extra) {
       const muSubpath = pathname.slice(V3_PREFIX.length);
       if (V3_ALLOWED_SUBPATHS.has(muSubpath)) {
-        const routed = applyMultiUserV3Routing(isoCtx, muSubpath);
+        const routed = routeV3ByUser(
+          { multiUserEnabled: true, ownerUserIds: deps.multiUserOwnerUserIds ?? [] },
+          isoResolved.ctx.userId,
+          muSubpath,
+        );
         if (!routed.ok) {
           sendJson(res, 400, errorEnvelope(400, routed.error, requestId));
           return true;
         }
-        isoCtx = routed.ctx;
+        if (routed.pool === "user") {
+          // Fail closed: without per-instance resolvers a user-pool request
+          // would silently land in the main store.
+          if (!deps.resolveStore || !deps.resolveStorage) {
+            deps.logger.error(
+              `${TAG} [${pathname}] per-user store routing requires resolveStore/resolveStorage deps — refusing to fall back to the main store`,
+            );
+            sendJson(res, 503, errorEnvelope(503, "Per-user store resolution unavailable", requestId));
+            return true;
+          }
+          scopeInstanceId = routed.scopeInstanceId;
+          routedUid = routed.uid;
+        }
       }
+    }
+
+    // Pre-resolve per-request store/storage, keyed by the scoped instance id
+    // (service mode → per-instance, standalone → core singleton).
+    const resolveStart = Date.now();
+    const effectiveAuth = scopeInstanceId ? { ...auth, serviceId: scopeInstanceId } : auth;
+    const resolved = await resolveStoreForRequest(effectiveAuth, deps);
+    const resolvedStorage = await resolveStorageForRequest(effectiveAuth, deps);
+    perfMark("resolveStoreAndStorage", `dur=${Date.now() - resolveStart}ms serviceId=${effectiveAuth.serviceId}`);
+
+    // Wrap deps so handlers use the resolved per-instance resources
+    const resolvedDeps: V2RouterDeps = {
+      ...deps,
+      getStore: () => resolved.store,
+      getEmbedding: () => resolved.embedding,
+      getStorage: () => resolvedStorage,
+    };
+    // Handlers notify the pipeline with auth.serviceId; a user-pool request
+    // must notify with the scoped id so its L1/L2/L3 tasks resolve her store.
+    if (scopeInstanceId && deps.notifyPipeline) {
+      const notify = deps.notifyPipeline;
+      const scoped = scopeInstanceId;
+      resolvedDeps.notifyPipeline = (_instanceId, sessionId, rounds, teamId, agentId) =>
+        notify(scoped, sessionId, rounds, teamId, agentId);
     }
 
     const depsWithIsolation: V2RouterDeps = {
@@ -734,7 +774,11 @@ export async function handleV2Route(
       isolationConfig: isV3
         ? { enforce: true, legacyCompatMode: false, legacyPlaceholder: resolvedDeps.isolationConfig?.legacyPlaceholder ?? "" }
         : resolvedDeps.isolationConfig,
-      requestIsolation: isoCtx,
+      // A user-pool request always writes the normalized uid, so a client that
+      // varies letter-case cannot scatter one user's rows over two user_ids.
+      requestIsolation: scopeInstanceId && routedUid !== undefined
+        ? { ...isoResolved.ctx, userId: routedUid }
+        : isoResolved.ctx,
       // resolveIsolation always returns { ok: true } — missing fields are filled with defaults.
       // requestIsolationMissing is only set when the caller explicitly needs to reject incomplete
       // isolation (e.g. /v3 strict mode), which is handled separately above via collectV3Missing.
@@ -807,12 +851,7 @@ async function handleConversationAdd(body: unknown, auth: V2AuthContext, request
   // 会 create asset + append 绑定；后续同 (team, agent) 走进程内 LRU 短路。
   // 失败降级：只打 warn，不阻塞 conversation 写入 —— 记忆数据的可用性优先
   // 于资产登记的一致性（asset 登记失败时下次调用会自动重试）。
-  //
-  // multiUser subsume 下跳过：team 槽位是 userId 冒名的，ensureChatMemoryAsset
-  // 会对每个 user 抛 team_mismatch（agent "default" 不属于 team {uid}，且失败
-  // 不进 LRU 缓存）→ 每次写都做一次注定失败的 metadata 往返 + warn。per-user
-  // 资产/clear 链路是 P1（设计文档 §4.2(c)）。
-  if (deps.getMetadataService && iso?.teamId && iso?.agentId && !iso?.subsumedTeam) {
+  if (deps.getMetadataService && iso?.teamId && iso?.agentId) {
     try {
       const metaSvc = await deps.getMetadataService(auth.serviceId);
       await metaSvc.ensureChatMemoryAsset({

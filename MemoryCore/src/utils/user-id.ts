@@ -36,7 +36,7 @@ export const DEFAULT_USER_ID = "default";
 /**
  * Shared 400 message for a rejected user id — reports the FIELD, never the
  * value (fail-closed no-echo contract). Single-sourced so the v3 dispatch
- * gate (`applyMultiUserV3Routing`) and the user_ids clear mode cannot drift
+ * gate (`routeV3ByUser`) and the user_ids clear mode cannot drift
  * apart in wording.
  */
 export const INVALID_USER_ID_MESSAGE =

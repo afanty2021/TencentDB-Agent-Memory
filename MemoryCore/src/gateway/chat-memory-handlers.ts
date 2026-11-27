@@ -101,7 +101,7 @@ export const chatMemoryUserClearRequestSchema = z.object({
 /** user 寻址模式的 agent 缺省：与插件侧 placeholder 一致。 */
 export const DEFAULT_CLEAR_AGENT_ID = "default";
 
-/** 共享时代的 team 占位（v2-router 的 TEAM_ID_PLACEHOLDER 同值同义）。 */
+/** 共享时代的 team 占位（与数据面 "default" 桶语义同值同义）。 */
 export const LEGACY_TEAM_ID = "default";
 
 /** 单个 memory 的清空结果。 */

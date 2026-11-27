@@ -62,6 +62,7 @@ import { validateAndNormalizeRaw, SeedValidationError } from "../core/seed/input
 import { executeSeed } from "../core/seed/seed-runtime.js";
 import type { SeedProgress } from "../core/seed/types.js";
 import { handleV2Route, errorEnvelope, makeRequestId } from "./v2-router.js";
+import { USER_SCOPE_PREFIX } from "../core/store/store-scope.js";
 import type { V2RouterDeps } from "./v2-router.js";
 import { handleV3MetaRoute, V3_PREFIX } from "../metadata/router/v3-meta-router.js";
 import { handleInternalMetaRoute, V3_INTERNAL_PREFIX } from "../metadata/router/internal-meta-router.js";
@@ -1142,6 +1143,27 @@ export class TdaiGateway {
         return await this.handleInstanceDestroyV3(req, res);
       }
 
+      // ── Reserved instance-id namespace（docs/per-user-stores-v3-design.md §4 规则 #1）──
+      //    `user:<uid>` 只能由网关在 dispatch 时铸造（routeV3ByUser）。这个
+      //    请求路由层的守卫盖住 handleRequest 下游的所有 /v2/*、/v3/* 分支
+      //    ——包括不经 handleV2Route 守卫的 offload 与 meta 路由（它们自带
+      //    parseV2Auth + resolveStorage，曾实测可用 `user:` 前缀读到
+      //    users/<uid>/ 下的文件，评审 I2）。守卫与 multiUser 开关无关。
+      //    /v2|/v3/instance/destroy 的实例号取自请求体、仅限受信内部调用方，
+      //    位于本守卫之前，属有意不覆盖。
+      if (pathname.startsWith("/v2/") || pathname.startsWith("/v3/")) {
+        const rawServiceId = req.headers["x-tdai-service-id"];
+        const serviceId = Array.isArray(rawServiceId) ? rawServiceId[0] : rawServiceId;
+        if (typeof serviceId === "string" && serviceId.startsWith(USER_SCOPE_PREFIX)) {
+          const requestId = makeRequestId();
+          this.logger.warn(
+            `[handleRequest] [${pathname}] rejected reserved service-id prefix (length=${serviceId.length})`,
+          );
+          sendJson(res, 400, errorEnvelope(400, "x-tdai-service-id uses a reserved prefix", requestId));
+          return;
+        }
+      }
+
       // ── v3 internal metadata（/v3/internal/meta/*，仅 Bearer）──
       if (pathname.startsWith(`${V3_INTERNAL_PREFIX}/`)) {
         if (!this.checkAuthForV2(req, res)) return;
@@ -1220,6 +1242,8 @@ export class TdaiGateway {
         // multiUser.enabled → v3 数据面 per-user 路由（user_id 归一化 +
         // team 槽 subsume），见 docs/v3-user-routing-design.md §4.2。
         multiUserEnabled: this.config.multiUser.enabled,
+        // 按人分库：owner 留主库（routeV3ByUser，docs/per-user-stores-v3-design.md §4）。
+        multiUserOwnerUserIds: this.config.multiUser.ownerUserIds,
         // handleConversationAdd 用它自动登记 chat_memory 资产（team+agent 粒度）
         // 并绑定到 agent。首次写入触发 create + bind；后续同 (team, agent) 走
         // MetadataService 的进程内 LRU 短路。
