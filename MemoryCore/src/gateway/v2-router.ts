@@ -391,9 +391,8 @@ export interface V2RouterDeps {
    */
   v3StrictIsolation?: boolean;
   /**
-   * `multiUser.enabled` — activates v3 data-plane per-user routing in
-   * dispatchV2Request (user_id normalization + team-slot subsume; see
-   * docs/v3-user-routing-design.md §4.2). Undefined = off.
+   * `multiUser.enabled` — activates v3 data-plane per-user store routing in
+   * `routeV3ByUser` (docs/per-user-stores-v3-design.md §4). Undefined = off.
    */
   multiUserEnabled?: boolean;
   /**

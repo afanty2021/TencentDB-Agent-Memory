@@ -1,5 +1,9 @@
 # v3 面按 user 路由 — 设计文档
 
+> **状态（2026-11-27）：Option B′-subsume 已被 [`per-user-stores-v3-design.md`](./per-user-stores-v3-design.md) 取代。**
+> 按用户裁定，v3 面改走物理分库 `users/<uid>/`。本文 §1（隔离模型实测）与 §2（列错位问题）仍然有效；
+> §4 的 subsume 路由、`scripts/backfill-multiuser-teams.ts` 及对应测试已随实施移除。
+
 状态：**v3.4（P0+P1 落地 + 全量后置评审闭环）** · 2026-09-25 · 基线分支 `port/multi-user-stores`
 前置：[PORT-NOTES.md](../PORT-NOTES.md)「Out of scope」第 1 条
 修订史：v2 = 评审轮 1 修正（附录 A）；v3 = 四项决策拍板 + 实施前验证推翻两处机制假设（§2.1、附录 B）；v3.1 = 评审轮 2 修正（clear 链表述纠正、delete 剥离类、资产登记跳过、dispatch 钉测、附录 C）；v3.2 = P1 clear 链落地（user 寻址 + wipeProfiles 旗标，附录 D）+ 评审轮 3 修正（mongo profile 滤镜、契约用例、部分失败语义，附录 D 补记）；v3.3 = P1 收口（写拒绝/auto-recall 穿线/回填脚本/e2e v3 断言全落地；e2e 实证 v3 数据落 instances/{serviceId} 实例库）；v3.4 = 评审轮 4+5 后置闭环（部分失败钉测、FTS 回填同步、e2e 门禁落地，附录 E）

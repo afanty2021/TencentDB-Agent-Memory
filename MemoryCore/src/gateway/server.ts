@@ -634,8 +634,8 @@ export class TdaiGateway {
       hostAdapter: adapter,
       config: this.config.memory,
       sessionFilter: new SessionFilter(this.config.memory.capture.excludeAgents),
-      // 与 v3 subsume 世界同形：本 core 的 L0 行/L2 键/auto-recall scope 全落
-      // team:{uid}|agent:default（主 core 不注入 → legacy default 桶行为不变）。
+      // v1 按人 core：L0 行/L2 键/auto-recall scope 全落 team:{uid}|agent:default
+      //（v3 用户库的行是 team_id="default"，两套语义并存——设计 §2 的非目标）。
       isolation: { teamId: uid, userId: uid },
     });
 
@@ -1240,8 +1240,8 @@ export class TdaiGateway {
         // `V3_STRICT_ISOLATION` controls only /v3 L0–L3 memory data-plane
         // strictness. Default OFF for local/integration; production should set it.
         v3StrictIsolation: resolveV3StrictIsolation(),
-        // multiUser.enabled → v3 数据面 per-user 路由（user_id 归一化 +
-        // team 槽 subsume），见 docs/v3-user-routing-design.md §4.2。
+        // multiUser.enabled → v3 数据面按人分库（routeV3ByUser），
+        // 见 docs/per-user-stores-v3-design.md §4。
         multiUserEnabled: this.config.multiUser.enabled,
         // 按人分库：owner 留主库（routeV3ByUser，docs/per-user-stores-v3-design.md §4）。
         multiUserOwnerUserIds: this.config.multiUser.ownerUserIds,

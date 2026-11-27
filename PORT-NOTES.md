@@ -50,12 +50,12 @@ re-applied by hand and re-verified by tests.
 
 ## Out of scope for this branch (follow-ups)
 
-- **v3-surface user routing**: DESIGNED — see `docs/v3-user-routing-design.md`.
-  Analysis found the plugin's constant `team_id="default"` collapses all
-  users' L2/L3 into one shared persona scope today (upstream profiles ignore
-  userId when teamId is present); the recommended fix is a per-user profile
-  scope mode gated by `multiUser.enabled`. Implementation is the P1-P2
-  follow-up, not part of this port.
+- **v3-surface user routing**: DONE as per-user physical stores — see
+  `docs/per-user-stores-v3-design.md`. The plugin's constant `team_id="default"`
+  no longer collapses users into one scope: under `multiUser.enabled` the v3
+  dispatch routes each regular user to her own store under `<baseDir>/users/<uid>/`
+  (reserved instance id `user:<uid>`). The earlier shared-store subsume design
+  (`docs/v3-user-routing-design.md`, Option B′) is superseded.
 - **Per-user cores in `deployMode: service`**: per-user dataDir isolation is
   proven for standalone sqlite; service mode stores via TCVDB/COS instance
   pools and needs its own isolation design.

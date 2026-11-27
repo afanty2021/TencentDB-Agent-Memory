@@ -35,9 +35,9 @@ export const DEFAULT_USER_ID = "default";
 
 /**
  * Shared 400 message for a rejected user id — reports the FIELD, never the
- * value (fail-closed no-echo contract). Single-sourced so the v3 dispatch
- * gate (`routeV3ByUser`) and the user_ids clear mode cannot drift
- * apart in wording.
+ * value (fail-closed no-echo contract). Single-sourced so every surface that
+ * validates a user id (the v3 dispatch gate `routeV3ByUser` first of all)
+ * rejects with the same wording.
  */
 export const INVALID_USER_ID_MESSAGE =
   "Invalid user_id: must be 1-64 chars of [a-z0-9_-] after trim/lowercase normalization (value not echoed)";

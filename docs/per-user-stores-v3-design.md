@@ -101,7 +101,7 @@ standalone 模式下「库在哪」只由两个点决定，且都以 `instanceId
 |---|---|---|
 | 1 | `x-tdai-service-id` 以保留前缀 `user:` 开头 | **400**（§11） |
 | 2 | `user_id` 归一化后非法（非 ASCII、含 `.`、空、超 64 字符等） | **400**，报文不回显原值 |
-| 3 | 写类路由（`/conversation/add`、`/atomic/update`、`/scenario/write`、`/scenario/rm`、`/core/write`）且 uid 为 `default`（缺省身份归一后即 `default`） | **400**——default 桶只读 |
+| 3 | 写类路由（`/conversation/add`、`/conversation/delete`、`/atomic/update`、`/atomic/delete`、`/scenario/write`、`/scenario/rm`、`/core/write`）且 uid 为 `default`（缺省身份归一后即 `default`） | **400**——default 桶只读（2026-11-27 A1 裁定：按 id 删亦属写门禁） |
 | 4 | uid ∈ `ownerUserIds` | 主库 |
 | 5 | uid 为 `default` | 主库（只读，见 #3） |
 | 6 | 其余 | 用户库 `users/<uid>/`，实例号 `user:<uid>` |
