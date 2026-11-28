@@ -801,12 +801,12 @@ describe("buildTaskExecutor RunScope (user-scoped pipeline tasks)", () => {
       // pass-through spy: the real handleSessionEnd still runs whenever the executor calls it
       const flush = vi.spyOn(h.core, "handleSessionEnd");
 
-      await h.executor.executeFlush(h.task("flush", "user:walnut"));
+      await h.executor.executeFlush(h.task("flush", "user:alice"));
       expect(flush).not.toHaveBeenCalled();
       const skipped = warnSpy.mock.calls
         .map((call: unknown[]) => String(call[0]))
         .find((line: string) => line.includes("flush skipped"));
-      expect(skipped).toContain("user:walnut");
+      expect(skipped).toContain("user:alice");
 
       // control: a main-instance flush still reaches the main core, for its own session
       await h.executor.executeFlush(h.task("flush", "default"));

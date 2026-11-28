@@ -99,15 +99,14 @@ function makeRoot(baseDir: string): void {
 // ── fixture: Gen B-era per-user store (legacy schema) ─────────────────
 
 /**
- * The real legacy object set, structure only (review I6): all four live
- * 2026-09 per-user stores are identical — 41 objects = these top-level
+ * A 2026-09-era legacy per-user store, structure only (review I6): the
+ * stores of that era are all identical — 41 objects = these top-level
  * objects plus the fts5/vec0 shadow tables and sqlite_sequence that SQLite
- * auto-creates for the virtual tables. Captured with a read-only
- * `mode=ro&immutable=1` connection in
- * `docs/plans/2026-11-27-per-user-stores-v3.review/evidence/live-legacy-legacyuser-ddl.sql`
- * (identical across legacyuser/cedar/maple/walnut). The import flow was run
- * against this exact object set during review: in-place adoption succeeds,
- * the vec0 tables survive as dead tables, and the numbers below match.
+ * auto-creates for the virtual tables. Captured from a live store with a
+ * read-only `mode=ro&immutable=1` connection; the captured evidence stays
+ * local and out of the repository. The import flow was run against this
+ * exact object set during review: in-place adoption succeeds, the vec0
+ * tables survive as dead tables, and the numbers below match.
  */
 const LEGACY_DDL = `
 CREATE TABLE embedding_meta (
@@ -323,12 +322,12 @@ describe("importPerUserStores", () => {
     alice.close();
 
     // the legacy store was upgraded in place by the engine's own migration, and its rows now belong to the user
-    const legacyuserDb = path.join(baseDir, "users", "legacyuser", "vectors.db");
-    const legacyuser = new DatabaseSync(legacyuserDb, { readOnly: true });
-    expect(cols(legacyuser, "l0_conversations")).toContain("user_id");
-    expect(cols(legacyuser, "l1_records")).toContain("version");
-    expect(legacyuser.prepare("SELECT user_id, COUNT(*) AS n FROM l0_conversations GROUP BY user_id").all()).toEqual([{ user_id: "legacyuser", n: 1 }]);
-    expect(legacyuser.prepare("SELECT user_id, COUNT(*) AS n FROM l1_records GROUP BY user_id").all()).toEqual([{ user_id: "legacyuser", n: 1 }]);
+    const legacyDb = path.join(baseDir, "users", "legacyuser", "vectors.db");
+    const legacy = new DatabaseSync(legacyDb, { readOnly: true });
+    expect(cols(legacy, "l0_conversations")).toContain("user_id");
+    expect(cols(legacy, "l1_records")).toContain("version");
+    expect(legacy.prepare("SELECT user_id, COUNT(*) AS n FROM l0_conversations GROUP BY user_id").all()).toEqual([{ user_id: "legacyuser", n: 1 }]);
+    expect(legacy.prepare("SELECT user_id, COUNT(*) AS n FROM l1_records GROUP BY user_id").all()).toEqual([{ user_id: "legacyuser", n: 1 }]);
 
     // Real-shape pin (review I6): the vec0 vector tables, their shadow objects
     // and embedding_meta survive in-place adoption as dead tables — the import
@@ -337,7 +336,7 @@ describe("importPerUserStores", () => {
     // live legacy stores carry the same 1024-dim vec0 tables; the live root
     // store itself is an adopted Gen B-era database that has been running for
     // a month, so this path has production precedent.
-    const objects = legacyuser
+    const objects = legacy
       .prepare("SELECT name FROM sqlite_schema WHERE type IN ('table','index') AND name NOT LIKE 'sqlite_%'")
       .all() as Array<{ name: string }>;
     const names = objects.map((o) => o.name);
@@ -349,7 +348,7 @@ describe("importPerUserStores", () => {
     ]) {
       expect(names, expected).toContain(expected);
     }
-    legacyuser.close();
+    legacy.close();
 
     // FTS: copied and relabelled rows are searchable through the engine (jieba-segmented index)
     const aliceStore = new VectorStore(aliceDb, 0, SILENT);
@@ -357,12 +356,12 @@ describe("importPerUserStores", () => {
     expect(aliceStore.searchL0Fts("raven", 20, { userId: "alice" }).map((r) => r.record_id)).toEqual(["m-a1"]);
     expect(aliceStore.searchL1Fts("raven", 20, { userId: "alice" }).map((r) => r.record_id)).toEqual(["mem-a1"]);
     aliceStore.close();
-    const legacyuserStore = new VectorStore(legacyuserDb, 0, SILENT);
-    legacyuserStore.init();
-    expect(legacyuserStore.isDegraded()).toBe(false); // the real-shape adoption never degrades
-    expect(legacyuserStore.searchL0Fts("listening", 20, { userId: "legacyuser" }).map((r) => r.record_id)).toEqual(["g-1"]);
-    expect(legacyuserStore.searchL1Fts("listening", 20, { userId: "legacyuser" }).map((r) => r.record_id)).toEqual(["g-m1"]);
-    legacyuserStore.close();
+    const legacyStore = new VectorStore(legacyDb, 0, SILENT);
+    legacyStore.init();
+    expect(legacyStore.isDegraded()).toBe(false); // the real-shape adoption never degrades
+    expect(legacyStore.searchL0Fts("listening", 20, { userId: "legacyuser" }).map((r) => r.record_id)).toEqual(["g-1"]);
+    expect(legacyStore.searchL1Fts("listening", 20, { userId: "legacyuser" }).map((r) => r.record_id)).toEqual(["g-m1"]);
+    legacyStore.close();
 
     // JSONL mirrors: only the user's own lines, under her own directory
     expect(jsonlLines(path.join(baseDir, "users", "alice", "conversations", "2026-11-01.jsonl"))).toBe(2);
