@@ -357,7 +357,7 @@ v1 协议的按人 core 路径及其 11 条单测原样保留。
 
 1. 备份：`sqlite3 -readonly <live>/vectors.db ".backup <备份目录>/vectors.db"`；`cp -R users/ <备份目录>/users/`。
 2. 导入 dry-run（`--owners huangzhengbo`），核对 §9 预期表。
-3. 导入 `--confirm`（此时开关未开，新库尚无人读）。
+3. 导入 `--confirm`（`--owners` 同第 2 步；此时开关未开，新库尚无人读）。
 4. 改仓内 `MemoryCore/tdai-gateway.yaml`：`multiUser.enabled: true`、`ownerUserIds: [huangzhengbo]`、`userPromptMode: chat`；提交。同时核对 `observability` 块保持全关（§11 遥测面：开启后搜索的查询原文与命中内容会随 span 外发）。
 5. 重启网关：结束 8420 监听进程，由插件监督器重拉（配置是网关侧读的，Hermes 不必重启）。避开周日 19:00–20:00 周报窗与 05:00 / 08:00 的 cron。
 6. 补跑一次导入（`--owners` 同第 2 步；幂等），收掉第 3 步到第 5 步之间的增量。此时开关已开、网关在写用户库，而每次 confirm 都会对每个用户库重建一次全文索引：自检的索引行数对账若恰好撞上同一用户库的并发写入，可能因多出一条重复索引行而报不通过——重跑一次即重建并通过（此为代码分析所得，未实测）。
