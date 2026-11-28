@@ -203,7 +203,7 @@ def test_on_turn_start_invalid_author_clears_identity(provider_with_fake_supervi
     """An author id the Gateway would reject must not be sent as-is."""
     provider = provider_with_fake_supervisor
 
-    provider.on_turn_start(1, "hello", author_id="wendy.li")
+    provider.on_turn_start(1, "hello", author_id="walnut.li")
 
     assert provider._current_user is None
 
@@ -320,7 +320,7 @@ def test_capture_falls_back_when_turn_author_id_invalid(provider_with_fake_super
     capture_called = threading.Event()
     fake.client.conversation_add.side_effect = lambda **kw: capture_called.set()
 
-    provider.sync_turn("u", "a", turn_author={"id": "wendy.li", "is_bot": False})
+    provider.sync_turn("u", "a", turn_author={"id": "walnut.li", "is_bot": False})
 
     assert capture_called.wait(timeout=2.0)
     assert fake.client.conversation_add.call_args.kwargs["user_id"] == "test-user"
@@ -469,30 +469,30 @@ def test_shutdown_end_session_falls_back_without_identity(provider_with_fake_sup
     ("raw", "expected"),
     [
         # lowercases and trims valid ids
-        ("Wendy", "wendy"),
-        ("  Wendy  ", "wendy"),
-        ("WENDY_1", "wendy_1"),
+        ("Walnut", "walnut"),
+        ("  Walnut  ", "walnut"),
+        ("WALNUT_1", "walnut_1"),
         # hyphens, underscores and digits
-        ("wendy-li", "wendy-li"),
+        ("walnut-li", "walnut-li"),
         ("user_01", "user_01"),
         ("a", "a"),
         # 64-char boundary accepted
         ("a" * 64, "a" * 64),
         # 65 chars rejected
         ("a" * 65, None),
-        # dots rejected (wendy.li and wendyli must never collide), no stripping
-        ("wendy.li", None),
-        ("wendyli", "wendyli"),
+        # dots rejected (walnut.li and walnutli must never collide), no stripping
+        ("walnut.li", None),
+        ("walnutli", "walnutli"),
         # empty / whitespace-only
         ("", None),
         ("   ", None),
         # Unicode whitespace is NOT trimmed (ASCII-only trim, paired with the
         # Gateway's /^[ \t\r\n\f\v]+|[ \t\r\n\f\v]+$/g): a bare Python
         # strip() would eat U+FEFF and accept an id the Gateway rejects.
-        ("\ufeffwendy", None),
-        ("wendy\u00a0", None),
+        ("\ufeffwalnut", None),
+        ("walnut\u00a0", None),
         # ASCII whitespace still trims
-        ("\t\nwendy\r\n", "wendy"),
+        ("\t\nwalnut\r\n", "walnut"),
         # non-ASCII
         ("王芳", None),
         ("wèndy", None),
@@ -505,8 +505,8 @@ def test_shutdown_end_session_falls_back_without_identity(provider_with_fake_sup
         (None, None),
         (42, None),
         (True, None),
-        ({"id": "wendy"}, None),
-        (["wendy"], None),
+        ({"id": "walnut"}, None),
+        (["walnut"], None),
     ],
 )
 def test_normalize_user_id_matches_gateway_semantics(raw, expected):

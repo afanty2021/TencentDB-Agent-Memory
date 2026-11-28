@@ -9,7 +9,7 @@
  *   - `users/a/vectors.db` and `users/b/vectors.db` exist on disk
  *   - a/b `/search/conversations` results are mutually invisible
  *   - the root (main) store holds no teacher data
- *   - `user_id=wendy.li` (invalid uid) fails closed to the main store
+ *   - `user_id=walnut.li` (invalid uid) fails closed to the main store
  *   - `/seed` with a regular user id → 403, without → 200
  *   - with `TDAI_MULTI_USER` off, the same requests all land in the main store
  *   - with an in-test mock OpenAI-compatible LLM, the real L1 extraction
@@ -646,7 +646,7 @@ describeRealGateway("gateway multi-user e2e (real subprocess + HTTP)", () => {
       expect(opsRes.l0_recorded).toBeGreaterThan(0);
 
       const wliRes = await captureRound(gw.baseUrl, {
-        user_id: "wendy.li", // dot is outside ^[a-z0-9_-]{1,64}$ → main store, no stripping
+        user_id: "walnut.li", // dot is outside ^[a-z0-9_-]{1,64}$ → main store, no stripping
         session_key: "sess-e2e-wli-1",
         user_content: "legacy round 1: the willow gate code is nine",
         assistant_content: "ack legacy round 1",
@@ -657,7 +657,7 @@ describeRealGateway("gateway multi-user e2e (real subprocess + HTTP)", () => {
       expect(fs.existsSync(path.join(gw.dataDir, "users", "a", "vectors.db"))).toBe(true);
       expect(fs.existsSync(path.join(gw.dataDir, "users", "b", "vectors.db"))).toBe(true);
       expect(fs.existsSync(path.join(gw.dataDir, "users", "ops-admin"))).toBe(false);
-      expect(fs.existsSync(path.join(gw.dataDir, "users", "wendy.li"))).toBe(false);
+      expect(fs.existsSync(path.join(gw.dataDir, "users", "walnut.li"))).toBe(false);
 
       // ── /search/conversations isolation: a and b are mutually invisible ──
       const aSeesOwn = await searchConversationsUntilVisible(gw.baseUrl, "magpie", "a", "sess-e2e-a-1");

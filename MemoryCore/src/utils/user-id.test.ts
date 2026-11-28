@@ -4,13 +4,13 @@ import { DEFAULT_USER_ID, normalizeUserId, resolveUserIdRouting } from "./user-i
 
 describe("normalizeUserId", () => {
   it("lowercases and trims valid ids", () => {
-    expect(normalizeUserId("Wendy")).toBe("wendy");
-    expect(normalizeUserId("  Wendy  ")).toBe("wendy");
-    expect(normalizeUserId("WENDY_1")).toBe("wendy_1");
+    expect(normalizeUserId("Walnut")).toBe("walnut");
+    expect(normalizeUserId("  Walnut  ")).toBe("walnut");
+    expect(normalizeUserId("WALNUT_1")).toBe("walnut_1");
   });
 
   it("accepts hyphens, underscores and digits", () => {
-    expect(normalizeUserId("wendy-li")).toBe("wendy-li");
+    expect(normalizeUserId("walnut-li")).toBe("walnut-li");
     expect(normalizeUserId("user_01")).toBe("user_01");
     expect(normalizeUserId("a")).toBe("a");
   });
@@ -20,10 +20,10 @@ describe("normalizeUserId", () => {
     expect(normalizeUserId("a".repeat(65))).toBeNull();
   });
 
-  it("rejects dots (paired regression: wendy.li and wendyli must never collide)", () => {
-    expect(normalizeUserId("wendy.li")).toBeNull();
-    expect(normalizeUserId("wendyli")).toBe("wendyli");
-    expect(normalizeUserId("wendy.li")).not.toBe(normalizeUserId("wendyli"));
+  it("rejects dots (paired regression: walnut.li and walnutli must never collide)", () => {
+    expect(normalizeUserId("walnut.li")).toBeNull();
+    expect(normalizeUserId("walnutli")).toBe("walnutli");
+    expect(normalizeUserId("walnut.li")).not.toBe(normalizeUserId("walnutli"));
   });
 
   it("rejects empty and whitespace-only ids", () => {
@@ -32,13 +32,13 @@ describe("normalizeUserId", () => {
   });
 
   it("rejects Unicode-whitespace-padded ids (ASCII-only trim, paired with Python .strip(\" \\t\\r\\n\\f\\v\"))", () => {
-    // JS `trim()` would strip the U+FEFF byte-order mark and accept "wendy";
+    // JS `trim()` would strip the U+FEFF byte-order mark and accept "walnut";
     // Python's bare `strip()` would do the same. Both sides now trim ASCII
     // whitespace only, so this must be REJECTED on both ends.
-    expect(normalizeUserId("\uFEFFwendy")).toBeNull();
-    expect(normalizeUserId("wendy\u00A0")).toBeNull();
+    expect(normalizeUserId("\uFEFFwalnut")).toBeNull();
+    expect(normalizeUserId("walnut\u00A0")).toBeNull();
     // ASCII whitespace still trims.
-    expect(normalizeUserId("\t\nwendy\r\n")).toBe("wendy");
+    expect(normalizeUserId("\t\nwalnut\r\n")).toBe("walnut");
   });
 
   it("rejects non-ASCII ids", () => {
@@ -58,8 +58,8 @@ describe("normalizeUserId", () => {
     expect(normalizeUserId(null)).toBeNull();
     expect(normalizeUserId(42)).toBeNull();
     expect(normalizeUserId(true)).toBeNull();
-    expect(normalizeUserId({ id: "wendy" })).toBeNull();
-    expect(normalizeUserId(["wendy"])).toBeNull();
+    expect(normalizeUserId({ id: "walnut" })).toBeNull();
+    expect(normalizeUserId(["walnut"])).toBeNull();
   });
 });
 
@@ -68,8 +68,8 @@ describe("resolveUserIdRouting", () => {
   const OFF = { multiUserEnabled: false, ownerUserIds: [] };
 
   it("routes everything to main when the feature is off (no warns, even for junk)", () => {
-    expect(resolveUserIdRouting(OFF, "wendy")).toEqual({ uid: "wendy", pool: "main", warn: false });
-    expect(resolveUserIdRouting(OFF, "wendy.li")).toEqual({ uid: null, pool: "main", warn: false });
+    expect(resolveUserIdRouting(OFF, "walnut")).toEqual({ uid: "walnut", pool: "main", warn: false });
+    expect(resolveUserIdRouting(OFF, "walnut.li")).toEqual({ uid: null, pool: "main", warn: false });
     expect(resolveUserIdRouting(OFF, undefined)).toEqual({ uid: null, pool: "main", warn: false });
   });
 
@@ -85,7 +85,7 @@ describe("resolveUserIdRouting", () => {
   });
 
   it("fails closed to main with a warning for invalid or missing uids", () => {
-    expect(resolveUserIdRouting(ON, "wendy.li")).toEqual({ uid: null, pool: "main", warn: true });
+    expect(resolveUserIdRouting(ON, "walnut.li")).toEqual({ uid: null, pool: "main", warn: true });
     expect(resolveUserIdRouting(ON, "")).toEqual({ uid: null, pool: "main", warn: true });
     expect(resolveUserIdRouting(ON, "../")).toEqual({ uid: null, pool: "main", warn: true });
     expect(resolveUserIdRouting(ON, "王芳")).toEqual({ uid: null, pool: "main", warn: true });
@@ -94,8 +94,8 @@ describe("resolveUserIdRouting", () => {
   });
 
   it("routes regular users to the per-user pool", () => {
-    expect(resolveUserIdRouting(ON, "wendy")).toEqual({ uid: "wendy", pool: "user", warn: false });
-    expect(resolveUserIdRouting(ON, "Wendy-Li_2")).toEqual({ uid: "wendy-li_2", pool: "user", warn: false });
+    expect(resolveUserIdRouting(ON, "walnut")).toEqual({ uid: "walnut", pool: "user", warn: false });
+    expect(resolveUserIdRouting(ON, "Walnut-Li_2")).toEqual({ uid: "walnut-li_2", pool: "user", warn: false });
   });
 
   it("treats invalid owner entries as absent (they match nothing)", () => {
@@ -104,6 +104,6 @@ describe("resolveUserIdRouting", () => {
     // an invalid uid → main + warn (not an owner hit).
     expect(resolveUserIdRouting(owners, "bad.id")).toEqual({ uid: null, pool: "main", warn: true });
     // A valid user is not protected by any invalid owner entry.
-    expect(resolveUserIdRouting(owners, "wendy")).toEqual({ uid: "wendy", pool: "user", warn: false });
+    expect(resolveUserIdRouting(owners, "walnut")).toEqual({ uid: "walnut", pool: "user", warn: false });
   });
 });

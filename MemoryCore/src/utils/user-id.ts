@@ -7,8 +7,8 @@
  *
  *   normalize: `lowercase(asciiTrim(raw))` must then match `^[a-z0-9_-]{1,64}$`
  *   in full, otherwise the id is invalid (null). Lowercase only — characters
- *   are NEVER stripped (fail-closed): an id like `wendy.li` is rejected
- *   outright rather than silently mapped onto `wendyli`.
+ *   are NEVER stripped (fail-closed): an id like `walnut.li` is rejected
+ *   outright rather than silently mapped onto `walnutli`.
  *
  *   Trim is ASCII-only (space, \t \n \v \f \r) on BOTH sides — JS `trim()`
  *   and Python `strip()` would additionally eat Unicode whitespace such as

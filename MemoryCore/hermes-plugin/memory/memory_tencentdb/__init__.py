@@ -101,8 +101,8 @@ def _normalize_user_id(raw: Any) -> Optional[str]:
     Mirrors ``normalizeUserId`` (MemoryCore/src/utils/user-id.ts) so both
     sides accept and reject the same ids: ``lowercase(ascii-trim(raw))`` must
     match ``^[a-z0-9_-]{1,64}$`` in full. Lowercase only — characters are
-    NEVER stripped (fail-closed): ``"Wendy.Li"`` is rejected outright instead
-    of being silently mapped onto ``"wendyli"`` (which would cross-contaminate
+    NEVER stripped (fail-closed): ``"Walnut.Li"`` is rejected outright instead
+    of being silently mapped onto ``"walnutli"`` (which would cross-contaminate
     two different users' stores). Returns ``None`` for non-strings and for
     values that do not match — callers treat ``None`` as "no identity".
     """

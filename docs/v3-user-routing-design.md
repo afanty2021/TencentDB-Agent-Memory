@@ -165,7 +165,7 @@ dispatch 在 gateway 进程内，`V2RouterDeps` 加一个 `multiUserEnabled: boo
 | `enabled=false` | 逐比特等于上游现行为（dispatch 归一整段不执行） |
 | 开启瞬间（L2/L3） | 已有 `profiles/team:default\|agent:default/` 共享 persona **对读写双双不可见**（新 scope `team:{uid}`）——灰度语义即"冷启动"，旧目录原样保留可回滚（**已拍板接受**） |
 | 开启瞬间（L0/L1 历史） | **不丢**：读端点剥离 team，按 user_id 过滤，割接前后两个时代的行同可见；删除（按 id/session）同剥离，语义与读对称；无需回填 |
-| 非 SDK/第三方调用方的 400 兼容 | `multiUser.enabled` 后，原先合法的自由串 user_id（如 `wendy.li`，上游 schema 无值域约束）在全部 18 个 v3 数据面端点变 **400**（fail-closed 归一化）。插件侧已按同规则归一（`_normalize_user_id`）不受影响；**任何直连 v3 数据面的第三方 SDK 需先对齐值域** `^[a-z0-9_-]{1,64}$`——上线前需盘点调用方 |
+| 非 SDK/第三方调用方的 400 兼容 | `multiUser.enabled` 后，原先合法的自由串 user_id（如 `walnut.li`，上游 schema 无值域约束）在全部 18 个 v3 数据面端点变 **400**（fail-closed 归一化）。插件侧已按同规则归一（`_normalize_user_id`）不受影响；**任何直连 v3 数据面的第三方 SDK 需先对齐值域** `^[a-z0-9_-]{1,64}$`——上线前需盘点调用方 |
 | P0→B′ 过渡 | **同形免迁移**：P0（dispatch 归一）写出的就是 `team:{uid}\|agent:{a}`，B′ 完整版（+写拒绝/auto-recall）落在同一形状上——不存在第二次冷启动（原 B 的 3 段语法才有此问题） |
 | 跨代混合会话 | L1 分组的 teamId 取自组内首行（时间序最早）的列（`pipeline-factory.ts:540`）：割切前开始的旧会话若含旧行（`team="default"`），其后续新消息仍归入共享 scope——**旧会长线程不享受 per-user persona**。缓解（可选 ops 步骤，非 P0 依赖）：一次性回填脚本 `team_id="default" → user_id`（L0/L1，user_id≠"default" 的行），使混合列归一。已拍板"接受 P0→B 数据迁移"精神下，此脚本列为 P1 交付 |
 | `V3_STRICT_ISOLATION` | 正交可叠加（B′ 下三元组仍齐全——插件照发 team_id，归一在服务端） |
